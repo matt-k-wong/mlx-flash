@@ -27,27 +27,16 @@
 
 ---
 
-## Benchmarks (16GB MacBook Air)
-
-| Model | Size | Mode | Load Time | Peak RAM (RSS) | Status |
-|-------|------|------|-----------|----------------|--------|
-| **Nemotron-30B** | 17.8 GB | Normal | 4.1s | 18+ GB (Swap) | ❌ Laggy |
-| **Nemotron-30B** | 17.8 GB | **Flash** | **0.8s** | **0.6 GB** | ✅ Smooth |
-
----
-
 ## Why Flash Mode?
 
-| Situation | Without Flash | With Flash |
-|-----------|--------------|-----------|
-| Llama-3.1-70B on 16 GB Air | ❌ OOM crash | ✅ ~5 tok/s |
-| DeepSeek-R1 671B (MoE) on 24 GB | ❌ OOM crash | ✅ ~3 tok/s |
-| Mixtral-8x22B on 32 GB Pro | ❌ OOM crash | ✅ ~6 tok/s |
-| Qwen2.5-72B on 48 GB Max | loads slowly | ✅ instant start, ~8 tok/s |
+| Model | Hardware | Mode | Load Time | Peak RAM (RSS) | Result |
+|-------|----------|------|-----------|----------------|--------|
+| **Nemotron-30B (17.8 GB)** | 16GB MacBook Air | Normal | 4.1s | 18+ GB (Swap) | ❌ Laggy |
+| **Nemotron-30B (17.8 GB)** | 16GB MacBook Air | **Flash** | **0.8s** | **0.6 GB** | ✅ Smooth |
 
 > [!IMPORTANT]
 > **Ignore the "Likely too large" warning in LM Studio.**  
-> Flash Mode is specifically designed to run models that LM Studio labels as too large for your Mac's RAM. When "Enable Flash Weight Streaming" is checked, the model will stream from your SSD, allowing even 70B+ models to run on 16GB Macs.
+> Flash Mode is specifically designed to run models that LM Studio labels as too large for your Mac's RAM. When "Enable Flash Weight Streaming" is checked, the model will stream from your SSD, allowing massive models to run on 16GB Macs without relying on slow OS swap.
 
 The secret: **Apple's unified memory is the GPU cache**.
   Model weights live on
