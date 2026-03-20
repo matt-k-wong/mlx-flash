@@ -50,6 +50,17 @@ This follows the approach pioneered in:
 
 ---
 
+## Current Status: Tested Proof of Concept
+
+This project provides a robust, zero-copy `mmap` engine that successfully bypasses Apple's Metal memory limits by forcing synchronous, layer-by-layer evaluation. It allows you to run models significantly larger than your physical RAM.
+
+However, because this is implemented as a Python "monkey-patch" on top of the existing `mlx_lm` and `mlx-engine` ecosystems, there are current limitations:
+
+*   **Long Context Windows:** While standard generation works flawlessly, pasting massive prompts (e.g., 5,000+ tokens) into a UI like LM Studio may still cause an `Out of Memory` crash. This is because the host engine's Prompt Processing (Prefill) phase attempts to evaluate the massive KV cache graph all at once, before our layer-by-layer patch can yield the memory back to the GPU.
+*   **The Future:** For 100% stability with infinite context lengths, this synchronous layer evaluation needs to be adopted directly within the C++ / core generation loops of inference engines, rather than patched via Python. This repository serves as the proven blueprint for that integration.
+
+---
+
 ## How It Works
 ```
 Disk (safetensors)
