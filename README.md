@@ -182,40 +182,30 @@ flowchart LR
 
 ## Performance
 
-Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe (~4 GB/s effective).
-`*` = estimated from bandwidth models; update after running `benchmarks/bench_flash.py`.
+Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe.
 
-### Dense models
+### Verified Models
 
-| Model | Quant | File | Normal RAM | Flash RAM | Flash tok/s* |
-|-------|-------|------|-----------|-----------|-------------|
-| Qwen2.5-3B (test target) | Q4_K_M | 2.0 GB | 2.4 GB | 1.6 GB | 65–85 |
-| Llama-3.2-8B | Q4_K_M | 4.9 GB | 5.5 GB | 2.8 GB | 28–42 |
-| Llama-3.1-70B | Q4_K_M | 40 GB | ❌ OOM | 8–10 GB | 4–8 |
-| Qwen2.5-72B | Q4_K_M | 41 GB | ❌ OOM | 8–10 GB | 4–8 |
+| Model | Architecture | File Size | Normal Peak RAM | Flash Peak RAM | Flash Load Time |
+|-------|--------------|-----------|-----------------|----------------|-----------------|
+| Nemotron-30B | Hybrid | 17.8 GB | 18+ GB (OOM/Swap) | **0.6 GB** | **0.8s** |
 
-### MoE models (top-K=2 of 8 experts loaded per layer)
-
-| Model | Active | File | Normal RAM | Flash RAM | Flash tok/s* |
-|-------|--------|------|-----------|-----------|-------------|
-| Mixtral-8×7B | ~13 B | 47 GB | ❌ OOM | 9–12 GB | 10–18 |
-| Mixtral-8×22B | ~39 B | 141 GB | ❌ OOM | 13–16 GB | 4–7 |
-| DeepSeek-V3 671B | ~37 B | ~230 GB | ❌ OOM | 13–18 GB | 3–6 |
-| DeepSeek-R1 671B | ~37 B | ~370 GB | ❌ OOM | 14–18 GB | 3–6 |
+*Note: For the Nemotron-30B benchmark, a synchronous layer-by-layer evaluation was utilized to bypass MLX graph compilation limits (see `docs/findings.md` for details).*
 
 > **Thunderbolt SSD (2–6 GB/s):** multiply tok/s by ~0.8×  
 > **Thunderbolt RAID (8–20 GB/s):** multiply tok/s by ~1.5–2.5×  
 > **M4 Pro / Max / Ultra (larger NVMe bandwidth):** multiply tok/s by ~1.2–2×
 
-### RAM headroom by Mac
+### RAM Headroom by Mac
 
-| Mac | Usable RAM | Max model (Flash) |
+With Flash Mode's synchronous layer execution, the primary constraint is no longer total physical RAM, but rather the size of the single largest layer and the speed of your NVMe drive. 
+
+| Mac | Usable RAM | Max Model (Flash) |
 |-----|-----------|-----------------|
-| M4 Air 16 GB | ~14 GB | 70 B dense / 671 B MoE |
-| M3 Pro 18 GB | ~16 GB | 70 B dense / 671 B MoE |
-| M4 Pro 24 GB | ~22 GB | 70 B dense / 671 B MoE |
-| M4 Max 48 GB | ~45 GB | 120 B dense / any MoE |
-| M2 Ultra 192 GB | all RAM | no Flash needed |
+| 16 GB | ~14 GB | Conceptually unbounded (storage limited) |
+| 18 GB | ~16 GB | Conceptually unbounded (storage limited) |
+| 24 GB | ~22 GB | Conceptually unbounded (storage limited) |
+| 192 GB| all RAM | Can likely load models fully into RAM (no Flash needed) |
 
 ---
 
