@@ -3,7 +3,7 @@
 > **Flash Weight Streaming for LM Studio** — run 70 B, 120 B, and 397 B MoE
 > models on a 16 GB MacBook Air.  One checkbox.  Zero quality loss.
 
-> **Project Lineage:** The original [`flash-moe`](https://github.com/danveloper/flash-moe) project successfully proved that streaming weights from NVMe could allow massive models to run on Apple Silicon. **The goal of this specific repository (`mlx-flash`) is to take that proven concept and provide a clean, drop-in integration for LM Studio** and other `mlx-engine` based frontends, turning a terminal demo into a one-click UI feature.
+> **Project Lineage:** The approach to streaming LLM weights directly from disk without loading them into RAM was heavily inspired by early conceptual work and research by **Andrej Karpathy** (such as his minimalist C implementations like `llama2.c`). Subsequently, Apple Research formalized this in *LLM in a Flash*, and the original [`flash-moe`](https://github.com/danveloper/flash-moe) project successfully proved that streaming weights from NVMe could allow massive models to run on Apple Silicon. **The goal of this specific repository (`mlx-flash`) is to take that proven concept and provide a clean, drop-in integration for LM Studio** and other `mlx-engine` based frontends, turning a terminal demo into a one-click UI feature.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://python.org)
