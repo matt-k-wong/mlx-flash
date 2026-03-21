@@ -1,9 +1,9 @@
 # mlx-flash ⚡
 
-> **Flash Weight Streaming for LM Studio** — run 70 B, 120 B, and 397 B MoE
-> models on a 16 GB MacBook Air.  One checkbox.  Zero quality loss.
+> **Flash Weight Streaming for MLX** — run 70 B, 120 B, and 397 B MoE
+> models on a 16 GB MacBook Air. **No additional quantisation — uses the model's native precision.**
 
-> **Project Lineage:** The approach to streaming LLM weights directly from disk without loading them into RAM was heavily inspired by early conceptual work and research by **Andrej Karpathy** (such as his minimalist C implementations like `llama2.c`). Subsequently, Apple Research formalized this in *LLM in a Flash*, and the original [`flash-moe`](https://github.com/danveloper/flash-moe) project successfully proved that streaming weights from NVMe could allow massive models to run on Apple Silicon. **The goal of this specific repository (`mlx-flash`) is to take that proven concept and provide a clean, drop-in integration for LM Studio** and other `mlx-engine` based frontends, turning a terminal demo into a one-click UI feature.
+> **Project Lineage:** The approach to streaming LLM weights directly from disk without loading them into RAM was heavily inspired by early conceptual work and research by **Andrej Karpathy** (such as his minimalist C implementations like `llama2.c`). Subsequently, Apple Research formalized this in *LLM in a Flash*, and the original [`flash-moe`](https://github.com/danveloper/flash-moe) project successfully proved that streaming weights from NVMe could allow massive models to run on Apple Silicon. **The goal of this specific repository (`mlx-flash`) is to take that proven concept and provide a clean, drop-in integration for the MLX ecosystem**, turning a terminal demo into a production-ready library.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://python.org)
@@ -40,11 +40,8 @@
 > **Ignore the "Likely too large" warning in LM Studio.**  
 > Flash Mode is specifically designed to run models that LM Studio labels as too large for your Mac's RAM. When "Enable Flash Weight Streaming" is checked, the model will stream from your SSD, allowing massive models to run on 16GB Macs without relying on slow OS swap.
 
-The secret: **Apple's unified memory is the GPU cache**.
-  Model weights live on
-your NVMe/SSD; macOS's page cache streams them into the shared CPU/GPU address
-space just-in-time via parallel `pread()`.  The GPU never waits for a VRAM
-copy — it reads directly from the same physical pages the CPU mapped.
+The secret: **Synchronous Layer Evaluation**.
+Standard MLX uses "lazy graph evaluation," which attempts to allocate all layer weights in memory at once, leading to OOM. `mlx-flash` bypasses this by forcing MLX to evaluate each layer synchronously (`mx.eval`), immediately clearing the Metal cache and releasing memory-mapped pages (`madvise(MADV_FREE)`) before moving to the next layer. 
 
 This follows the approach pioneered in:
 - Apple Research: [*LLM in a Flash* (arXiv 2312.11514)](https://arxiv.org/abs/2312.11514)
@@ -64,15 +61,15 @@ However, because this is implemented as a Python "monkey-patch" on top of the ex
 ---
 
 ## How It Works
+
 ```
 Disk (safetensors)
-    ↓  parallel pread()  [4–8 threads, GIL-free]
+    ↓  mmap() [Zero-copy mapping]
 macOS Unified Page Cache  ← madvise(WILLNEED) prefetch
     ↓  zero-copy DMA
 Metal GPU (unified address space)
-    ↓  FMA dequant kernel  (Q4→fp16 on-chip)
-    ↓  fused SwiGLU kernel
-    ↓  matmul / attention
+    ↓  Synchronous Layer eval (mx.eval)
+    ↓  Metal Cache Clear + madvise(MADV_FREE)
     ↓
 Output tokens
 ```
@@ -80,93 +77,76 @@ Output tokens
 Key principles:
 1. **Trust the OS page cache** — macOS LRU eviction is faster than any
    custom cache you can write.
-2. **Parallel `pread()`** — `os.pread()` is thread-safe, GIL-releasing, and
-   allows 4–8 concurrent disk reads with zero seek latency.
+2. **Synchronous Execution** — Bypass MLX's lazy graph by evaluating one 
+   layer at a time. This keeps Peak RSS strictly bounded by the size of the 
+   largest single layer.
 3. **madvise(WILLNEED)** — prefetch the *next* layer while computing the
-   *current* layer, hiding I/O latency completely.
-4. **madvise(DONTNEED/FREE)** — release pages for cold layers so macOS can
-   keep hot ones resident; typical resident set stays at 7–15 GB.
-5. **FMA dequant on GPU** — 4-bit → fp16 happens in a single Metal kernel
-   pass with fused multiply-add; zero extra memory copies.
-6. **MoE top-K streaming** — for MoE models, only the top-K active experts
-   are read from disk per token batch (typically K=2 of 8, or K=4 of 64/128).
+   *current* layer, hiding I/O latency.
+4. **madvise(MADV_FREE)** — On macOS, forcefully hint to the kernel that 
+   pages for "cold" layers are immediately available for reuse.
+5. **No Extra Quantisation** — Weights are streamed in their native format 
+   (e.g., 4-bit or BF16) directly to the GPU.
 
 ---
 
 ## Architecture Diagrams
 
-### 1 · System Architecture
+### 1 · Current Implementation (Synchronous Flow)
 ```mermaid
 graph TB
-    subgraph UI["LM Studio UI"]
-        CB["☑ Enable Flash Weight Streaming"]
-        MF["Modelfile: FLASH true"]
+    subgraph UI["Frontends"]
+        CL["CLI / prove_flash_manual.py"]
+        GS["FlashGenerationLoop"]
     end
 
     subgraph EXT["mlx-flash"]
         FM["FlashManager"]
-        WS["WeightStreamer\nparallel pread()"]
+        WS["WeightStreamer\nmmap-based"]
         PF["WeightPrefetcher\nbackground thread"]
-        MR["MoERouter\ntop-K selection"]
         PC["macOS Unified Page Cache\nshared CPU+GPU pages"]
     end
 
-    subgraph MTL["Metal GPU Kernels (optional, AOT compiled)"]
-        DQ["flash_dequant_4bit\nFMA Q4→fp16"]
-        SG["swiglu_fused\nSiLU × gate"]
-        MD["moe_dispatch\nexpert routing"]
+    subgraph FLOW["Sync Pipeline"]
+        EV["mx.eval(layer_N)"]
+        CC["Metal Cache Clear"]
+        MF["madvise(MADV_FREE)"]
     end
 
-    subgraph DISK["Storage  (transparent to Flash Mode)"]
-        NV["Internal NVMe  3–7 GB/s"]
-        TB["Thunderbolt SSD  2–6 GB/s"]
-        RA["TB RAID Array  8–20 GB/s"]
-    end
-
-    CB --> FM
-    MF --> FM
+    CL --> GS
+    GS --> FM
     FM --> WS
-    FM --> MR
     WS <--> PC
     PF -.->|prefetch hint| WS
-    PC --> DQ --> SG
-    MR --> MD --> SG
-    NV --> WS
-    TB --> WS
-    RA --> WS
+    PC --> EV
+    EV --> CC
+    CC --> MF
 ```
 
-### 2 · Layer Streaming Pipeline
+### 2 · Future Roadmap (Parallel Aspirational Pipeline)
 ```mermaid
 sequenceDiagram
-    participant UI  as LM Studio
+    participant UI  as LM Studio / CLI
     participant FM  as FlashManager
     participant PF  as Prefetcher (bg)
     participant WS  as WeightStreamer
     participant PC  as Page Cache
     participant GPU as Metal GPU
 
-    UI  ->> FM  : generate(prompt, flash=True)
-    FM  ->> WS  : open_model(path)
-    WS  ->> PC  : mmap headers only (~KB)
-    PC  -->> FM  : weight index ready
+    Note over UI,GPU: This parallel flow requires deep integration into MLX C++ core
 
     loop Forward pass – each transformer layer N
         FM  ->> PF  : prefetch_layer(N+1)
         PF  -->> PC : madvise(WILLNEED, layer_N+1_pages)
         FM  ->> WS  : get_layer_weights(N)
-        WS  ->> PC  : pread(layer_N_offsets) ×4 threads
+        WS  ->> PC  : Parallel pread() ×4 threads
         PC  -->> GPU: zero-copy page mapping
         GPU ->> GPU : dequant_4bit (FMA kernel)
         GPU ->> GPU : attention + FFN
         GPU -->> FM  : activations[N]
-        FM  ->> PC  : madvise(DONTNEED, layer_N-2_pages)
     end
-
-    FM  -->> UI  : token stream
 ```
 
-### 3 · MoE Expert Streaming Flow
+### 3 · MoE Expert Streaming Flow (Roadmap)
 ```mermaid
 flowchart LR
     subgraph RT["Router Pass (dense, fast)"]
@@ -178,20 +158,25 @@ flowchart LR
     subgraph IO["Parallel Expert Load"]
         TK --> P0["pread\nExpert idx[0]"]
         TK --> P1["pread\nExpert idx[1]"]
-        TK --> P2["pread\nExpert idx[K-1]"]
     end
 
     subgraph CMP["GPU Compute (pipelined)"]
         P0 --> D0["dequant\nFMA"]
         P1 --> D1["dequant\nFMA"]
-        P2 --> D2["dequant\nFMA"]
-        D0 & D1 & D2 --> COM["Combine\n+ route weights\n(softmax)"]
+        D0 & D1 --> COM["Combine\n+ route weights\n(softmax)"]
     end
 
     COM --> OUT["Output\n[B × D]"]
 ```
 
 ---
+
+## Current Limitations
+
+- **Lazy Graph OOM:** Standard `mlx_lm.stream_generate()` integration still causes OOM for models significantly larger than RAM because it attempts to build the full execution graph.
+- **True Flash Mode:** Currently requires using the `FlashGenerationLoop` (synchronous path) available in `scripts/prove_flash_manual.py`.
+- **Long Context:** Context lengths beyond 5,000 tokens may OOM during the prefill phase as the KV cache is not yet synchronously managed.
+- **MoE Experts:** MoE expert streaming is not yet implemented in the `FlashModelLoader`.
 
 ## Performance
 
@@ -201,9 +186,9 @@ Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe.
 
 | Model | Architecture | File Size | Normal Peak RAM | Flash Peak RAM | Flash Load Time |
 |-------|--------------|-----------|-----------------|----------------|-----------------|
-| Nemotron-30B | Hybrid | 17.8 GB | 18+ GB (OOM/Swap) | **0.6 GB** | **0.8s** |
+| Nemotron-30B | Hybrid | 17.8 GB | 18+ GB (OOM/Swap) | **0.6 GB¹** | **0.8s** |
 
-*Note: For the Nemotron-30B benchmark, a synchronous layer-by-layer evaluation was utilized to bypass MLX graph compilation limits (see `docs/findings.md` for details).*
+¹ *Achieved via synchronous layer evaluation (`scripts/prove_flash_manual.py`). The standard `mlx_lm.stream_generate()` integration is not yet able to achieve this figure — see `docs/findings.md`.*
 
 > **Thunderbolt SSD (2–6 GB/s):** multiply tok/s by ~0.8×  
 > **Thunderbolt RAID (8–20 GB/s):** multiply tok/s by ~1.5–2.5×  
@@ -238,13 +223,13 @@ python benchmarks/bench_flash.py --model /path/to/model --mode both
 
 ## LM Studio Usage
 
-1. Open **LM Studio** → **Preferences** → **Inference**.
+> [!WARNING]
+> **This project currently provides the backend library.**  
+> LM Studio UI integration requires a pending PR to `lmstudio-ai/mlx-engine` (see `docs/lmstudio_integration.md`). For now, please use `scripts/prove_flash_manual.py` directly to experience the synchronous streaming path.
+
+1. Once the integration is merged, open **LM Studio** → **Preferences** → **Inference**.
 2. Check **☑ Enable Flash Weight Streaming (low-RAM mode)**.
 3. Load any model that would otherwise OOM — it will start streaming.
-4. Optionally tune **Flash RAM Budget (GB)** (default: 10 GB).
-
-The checkbox maps to a `flash_mode: true` key injected into mlx-engine's
-`GenerationConfig`; this extension intercepts that key before model loading.
 
 ---
 
