@@ -1,3 +1,11 @@
+from __future__ import annotations
+
+import ctypes
+import mmap
+import os
+import sys
+from typing import Any
+
 """
 page_cache.py — macOS unified page cache management via madvise().
 
@@ -18,13 +26,6 @@ safe as long as the mmap object is kept alive.
 This module is macOS-only.  On other platforms all functions are no-ops so
 that the rest of the code runs in CI (Linux / Windows).
 """
-
-from __future__ import annotations
-
-import ctypes
-import mmap
-import os
-import sys
 
 _IS_MACOS = sys.platform == "darwin"
 

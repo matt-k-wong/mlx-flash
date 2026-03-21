@@ -1,7 +1,5 @@
 
-import functools
 import pathlib
-from typing import Any
 
 from ..config import FlashConfig
 
@@ -20,8 +18,8 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
         config = FlashConfig(enabled=False)
 
     try:
-        import mlx_lm
         import mlx.core as mx
+        import mlx_lm
     except ImportError as e:
         raise ImportError("mlx_lm not installed") from e
 
@@ -57,7 +55,6 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
             # We can't use mlx_lm.stream_generate directly because it expects 
             # the base model and builds a full graph.
             # We must use our custom FlashGenerationLoop or a simplified version.
-            from ..generation import FlashGenerationLoop
             # Note: This is slightly suboptimal as it re-loads or wraps.
             # In a real integration, we'd use the FlashLLM directly.
             # For now, we manually iterate to keep it drop-in.
@@ -100,7 +97,8 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
 def remove_flash_patch() -> None:
     """Restore the original state."""
     global _ORIGINAL_LOAD, _ORIGINAL_STREAM_GENERATE, _ORIGINAL_GENERATE, _LAST_LOOP
-    if _ORIGINAL_LOAD is None: return
+    if _ORIGINAL_LOAD is None:
+        return
     
     import mlx_lm
     mlx_lm.load = _ORIGINAL_LOAD
@@ -118,7 +116,8 @@ def remove_flash_patch() -> None:
 
 
 def _should_use_flash(model_path: str, config: FlashConfig) -> bool:
-    if config.enabled: return True
+    if config.enabled:
+        return True
     p = pathlib.Path(model_path)
     for mf_name in ("Modelfile", "modelfile"):
         mf_path = p / mf_name

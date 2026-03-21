@@ -1,9 +1,12 @@
-import mlx_lm
-import mlx.core as mx
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any
+
+import mlx.core as mx
+import mlx_lm
+
 from .config import FlashConfig
 from .generation import FlashLLM
+
 
 class FlashManager:
     """
@@ -25,7 +28,7 @@ class FlashManager:
             # Older MLX versions might not have this
             pass
 
-    def load(self, model_path: str | Path) -> Tuple[FlashLLM, Any]:
+    def load(self, model_path: str | Path) -> tuple[FlashLLM, Any]:
         """
         Load a model in lazy mode and wrap it for Flash execution.
         """

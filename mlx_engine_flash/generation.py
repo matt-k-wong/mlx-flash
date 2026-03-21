@@ -1,15 +1,16 @@
 import sys
 import time
-from typing import Any, Optional, Generator, List, Tuple, Dict
+from collections.abc import Generator
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 import mlx_lm
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx.utils import tree_flatten
+from mlx_lm.models.cache import RotatingKVCache, make_prompt_cache
 
 from .config import FlashConfig
+
 
 class FlashLLM(nn.Module):
     """
@@ -81,8 +82,8 @@ class FlashLLM(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: Optional[list] = None,
-        mask: Optional[mx.array] = None,
+        cache: list | None = None,
+        mask: mx.array | None = None,
         **kwargs,
     ) -> mx.array:
         """Synchronous per-layer forward pass."""
@@ -140,11 +141,17 @@ class FlashLLM(nn.Module):
             # Telemetry
             if self._config.monitor_queue is not None:
                 try:
+                    # Robust memory API check
+                    try:
+                        mem = mx.metal.get_active_memory()
+                    except AttributeError:
+                        mem = mx.get_active_memory()
+                    
                     self._config.monitor_queue.put_nowait({
                         "type": "layer_complete",
                         "layer": i + 1,
                         "n_layers": self._n_layers,
-                        "metal_active_mb": mx.get_active_memory() / 1e6,
+                        "metal_active_mb": mem / 1e6,
                         "timestamp": time.monotonic(),
                     })
                 except Exception:
@@ -167,6 +174,7 @@ class FlashLLM(nn.Module):
 def _prefetch_layer_params(layer: nn.Module) -> None:
     """Issue madvise(WILLNEED) on the mmap pages of a layer's parameters."""
     import ctypes
+
     from .page_cache import MADV_WILLNEED, get_libc
     libc = get_libc()
     if libc is None:
@@ -194,13 +202,13 @@ class DiskKVCache:
         self._max_in_mem = max_in_memory_tokens
         self._n_layers = n_layers
     
-    def evict_to_disk(self, layer_idx: int, keys: mx.array, values: mx.array, token_range: Tuple[int, int]):
+    def evict_to_disk(self, layer_idx: int, keys: mx.array, values: mx.array, token_range: tuple[int, int]):
         """Evict a range of KV entries to disk (safetensors format)."""
         path = self._dir / f"layer_{layer_idx}_tokens_{token_range[0]}_{token_range[1]}.safetensors"
         mx.save_safetensors(str(path), {"k": keys, "v": values})
         return path
     
-    def load_from_disk(self, layer_idx: int, token_range: Tuple[int, int]):
+    def load_from_disk(self, layer_idx: int, token_range: tuple[int, int]):
         """Load KV entries back from disk (lazy, mmap-backed)."""
         path = self._dir / f"layer_{layer_idx}_tokens_{token_range[0]}_{token_range[1]}.safetensors"
         data = mx.load(str(path))
@@ -231,7 +239,7 @@ class FlashGenerationLoop:
                 n_layers, config.max_in_memory_kv_tokens, config.kv_cache_dir
             )
 
-    def _chunked_prefill(self, prompt_tokens: List[int], **kwargs):
+    def _chunked_prefill(self, prompt_tokens: list[int], **kwargs):
         """Process a long prompt in chunks to avoid attention OOM."""
         chunk_size = self.config.prefill_chunk_size
         num_tokens = len(prompt_tokens)
@@ -264,20 +272,18 @@ class FlashGenerationLoop:
         # mlx_lm expects the model to be callable and return logits
         logits = self._chunked_prefill(tokens, **kwargs)
         
-        count = 0
-        from mlx_lm.generate import generate_step
-        
         # The first token is already computed in prefill logits
         y = mx.argmax(logits[:, -1, :], axis=-1)
         yield self.tokenizer.decode([y.item()])
         
-        for token_id, _ in generate_step(y, self.flash_model, prompt_cache=self._cache, sampler=sampler, **kwargs):
+        from mlx_lm.generate import generate_step
+        
+        for count, (token_id, _) in enumerate(generate_step(y, self.flash_model, prompt_cache=self._cache, sampler=sampler, **kwargs)):
             if count >= max_tokens - 1:
                 break
             if token_id == self.tokenizer.eos_token_id:
                 break
             yield self.tokenizer.decode([token_id])
-            count += 1
 
     def shutdown(self):
         pass

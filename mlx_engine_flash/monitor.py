@@ -5,14 +5,14 @@ This tool provides a real-time terminal UI for monitoring MLX memory usage
 and Flash Mode execution progress.
 """
 
+import curses
+import json
 import os
 import sys
 import time
-import json
-import curses
+from typing import Any
+
 import psutil
-from datetime import datetime
-from typing import Optional, Dict, Any
 
 try:
     import mlx.core as mx
@@ -20,8 +20,9 @@ try:
 except ImportError:
     _HAS_MLX = False
 
-import threading
+import contextlib
 import queue
+import threading
 
 STATE_FILE = "/tmp/mlx_flash_monitor.json"
 
@@ -39,8 +40,9 @@ class TelemetryBridge(threading.Thread):
                 event = self.queue.get(timeout=1.0)
                 try:
                     with open(STATE_FILE, "w") as f:
-                        json.dump(event, f)
-                except: pass
+                         json.dump(event, f)
+                except Exception:
+                    pass
                 # self.queue.task_done() -- not strictly needed for daemon thread
             except queue.Empty:
                 continue
@@ -53,7 +55,6 @@ class TelemetryBridge(threading.Thread):
 def start_telemetry(config: Any):
     """Initialize the telemetry bridge for external monitors."""
     if config.monitor_queue is None:
-        import queue
         config.monitor_queue = queue.Queue()
     bridge = TelemetryBridge(config.monitor_queue)
     bridge.start()
@@ -75,7 +76,8 @@ def get_model_process():
 
 def draw_bar(val: float, max_val: float, width: int) -> str:
     """Render a text progress bar."""
-    if max_val <= 0: return "░" * width
+    if max_val <= 0:
+        return "░" * width
     filled = int((val / max_val) * width)
     filled = max(0, min(width, filled))
     return "█" * filled + "░" * (width - filled)
@@ -104,21 +106,22 @@ def monitor_loop(stdscr, model_name: str = "MLX Model"):
             try:
                 metal_active = mx.get_active_memory() / 1e6
                 metal_peak = mx.get_peak_memory() / 1e6
-            except: pass
+            except Exception:
+                pass
             
         process = get_model_process()
         rss = 0.0
         if process:
-            try:
+            with contextlib.suppress(Exception):
                 rss = process.memory_info().rss / 1e6
-            except: pass
             
         # Try to read per-layer state
         try:
             if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r') as f:
+                with open(STATE_FILE) as f:
                     last_layer_state = json.load(f)
-        except: pass
+        except Exception:
+            pass
         
         # 2. Render Header
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
@@ -170,9 +173,7 @@ def monitor_loop(stdscr, model_name: str = "MLX Model"):
                  stdscr.attroff(curses.color_pair(4))
 
         stdscr.addstr(12, 2, "─" * (w - 4))
-        stdscr.addstr(13, 4, "Budget: 16.0 GB  │  Actual peak: %.1f GB  │  Saving: %.1f GB" % (
-            metal_peak / 1000, (16000 - metal_peak) / 1000
-        ))
+        stdscr.addstr(13, 4, f"Budget: 16.0 GB  │  Actual peak: {metal_peak / 1000:.1f} GB  │  Saving: {(16000 - metal_peak) / 1000:.1f} GB")
         
         stdscr.refresh()
         
@@ -181,7 +182,8 @@ def monitor_loop(stdscr, model_name: str = "MLX Model"):
             key = stdscr.getch()
             if key in (ord('q'), 27): # q or ESC
                 break
-        except: pass
+        except Exception:
+            pass
         
         time.sleep(0.2)
 

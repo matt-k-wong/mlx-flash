@@ -1,15 +1,11 @@
-import os
-import psutil
+import importlib.util
 import subprocess
 import time
-from typing import Dict, Any, Optional
 from contextlib import contextmanager
 
-try:
-    import mlx.core as mx
-    _HAS_MLX = True
-except ImportError:
-    _HAS_MLX = False
+import psutil
+
+_HAS_MLX = importlib.util.find_spec("mlx.core") is not None
 
 def get_metal_stats() -> dict:
     try:
@@ -110,7 +106,7 @@ class RAMProfiler:
         prev_rss = base_rss
         prev_metal = base_metal
         
-        for i, snap in enumerate(self.snapshots):
+        for _i, snap in enumerate(self.snapshots):
             rss = snap["rss_mb"]
             metal = snap["metal_active_mb"]
             pc = snap["page_cache_mb"]

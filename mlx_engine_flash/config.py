@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import queue
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Any
+from typing import Literal
 
 
 @dataclass
@@ -58,15 +58,15 @@ class FlashConfig:
     debug: bool = False
 
     # KV Cache & Prefill Memory Management
-    max_kv_size: Optional[int] = None           # None = unlimited; 4096 = safe for 16GB
+    max_kv_size: int | None = None           # None = unlimited; 4096 = safe for 16GB
     kv_keep: int = 250                          # tokens to keep during rotation
     prefill_chunk_size: int = 512              # tokens per prefill chunk; 0 = no chunking
-    kv_cache_dir: Optional[str] = None         # If set, enable disk KV cache
+    kv_cache_dir: str | None = None         # If set, enable disk KV cache
     max_in_memory_kv_tokens: int = 2048        # evict to disk above this
-    moe_top_k_override: Optional[int] = None   # For MoE weight streaming
+    moe_top_k_override: int | None = None   # For MoE weight streaming
     
     # Telemetry
-    monitor_queue: Optional[queue.Queue] = None # If set, emit telemetry events
+    monitor_queue: queue.Queue | None = None # If set, emit telemetry events
 
     # Derived / auto-detected — not set by user
     _n_cpu_cores: int = field(default_factory=lambda: os.cpu_count() or 4,

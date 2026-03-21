@@ -19,8 +19,8 @@ Or via Modelfile:
 """
 
 from .config import FlashConfig
+from .generation import FlashGenerationLoop, FlashLLM
 from .manager import FlashManager
-from .generation import FlashLLM, FlashGenerationLoop
 from .page_cache import prefetch_array, release_array
 
 __all__ = [
