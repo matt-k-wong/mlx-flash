@@ -1,4 +1,5 @@
 import inspect
+import os
 import sys
 import time
 from collections.abc import Generator
@@ -263,25 +264,34 @@ class FlashGenerationLoop:
         kwargs["sampler"] = make_sampler(**sampler_args)
 
         # Inject DiskKVCache if enabled
-        print(f"[DEBUG] Flash config disk_kv_enabled: {getattr(self.config, 'disk_kv_enabled', None)}")
         if getattr(self.config, "disk_kv_enabled", False):
             if "prompt_cache" not in kwargs:
-                print(f"[DEBUG] Injecting DiskKVCache into kwargs...")
                 from mlx_flash.disk_kv_cache import DiskKVCache
                 import shutil
-                from pathlib import Path
-                
-                kv_dir = Path(getattr(self.config, "disk_kv_dir", "/tmp/mlx_flash_kv"))
+                import tempfile
+                import uuid
+
+                kv_dir_cfg = getattr(self.config, "disk_kv_dir", "")
+                if kv_dir_cfg:
+                    kv_dir = Path(kv_dir_cfg)
+                else:
+                    kv_dir = Path(tempfile.gettempdir()) / f"mlx_flash_kv_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
                 # Wipe old cache to ensure clean context
                 if kv_dir.exists():
                     shutil.rmtree(kv_dir, ignore_errors=True)
                 kv_dir.mkdir(parents=True, exist_ok=True)
-                
+
+                max_tokens = getattr(self.config, "disk_kv_max_tokens", None)
+
                 # Build the array of DiskKVCaches
-                prompt_cache = [DiskKVCache(layer_idx=i, cache_dir=str(kv_dir)) 
+                prompt_cache = [DiskKVCache(layer_idx=i, cache_dir=str(kv_dir), max_tokens=max_tokens)
                               for i in range(self.flash_model._n_layers)]
                 kwargs["prompt_cache"] = prompt_cache
-                print(f"[DEBUG] Injected {len(prompt_cache)} DiskKVCache layers at {kv_dir}")
+                self._disk_kv_caches = prompt_cache
+
+                if self.config.debug:
+                    print(f"[flash] Injected {len(prompt_cache)} DiskKVCache layers at {kv_dir}", file=sys.stderr)
 
         for result in mlx_lm.stream_generate(
             self.flash_model, self.tokenizer, prompt,
@@ -292,6 +302,11 @@ class FlashGenerationLoop:
     def shutdown(self):
         """Clean up resources."""
         import contextlib
+        # Close DiskKVCache layers if they exist
+        for cache in getattr(self, "_disk_kv_caches", []):
+            with contextlib.suppress(Exception):
+                cache.close()
+        self._disk_kv_caches = []
         with contextlib.suppress(AttributeError, Exception):
             mx.metal.clear_cache()
         self.flash_model = None

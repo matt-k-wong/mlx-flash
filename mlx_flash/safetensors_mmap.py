@@ -3,6 +3,8 @@ import mmap
 import os
 import struct
 from pathlib import Path
+from typing import Any
+
 from .prefetch_worker import BackgroundPrefetcher
 
 class SafetensorsMmapCache:

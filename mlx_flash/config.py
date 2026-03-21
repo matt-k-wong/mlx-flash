@@ -67,7 +67,8 @@ class FlashConfig:
     
     # Disk KV Cache Offloading (v0.3.1)
     disk_kv_enabled: bool = False
-    disk_kv_dir: str = "/tmp/mlx_flash_kv"
+    disk_kv_dir: str = ""                    # Empty = auto-generate unique path
+    disk_kv_max_tokens: int | None = None    # None = unlimited; set to bound disk usage
     
     # Telemetry
     monitor_queue: queue.Queue | None = None # If set, emit telemetry events
