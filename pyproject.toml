@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-flash"
-version = "0.1.0"
+version = "0.1.1"
 description = "Flash Weight Streaming (low-RAM mode) for LM Studio / mlx-engine"
 readme = "README.md"
 license = { file = "LICENSE" }

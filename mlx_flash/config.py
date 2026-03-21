@@ -56,6 +56,7 @@ class FlashConfig:
     expert_cache_size: int = 8                                       # Planned v0.3+ (MoE)
     strict_guardrails: bool = True                                   # Planned v0.2+
     debug: bool = False
+    pipeline_depth: int = 2                                          # Number of layers to keep in flight
 
     # KV Cache & Prefill Memory Management
     max_kv_size: int | None = None           # None = unlimited; 4096 = safe for 16GB

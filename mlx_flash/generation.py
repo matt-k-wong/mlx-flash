@@ -11,6 +11,7 @@ import mlx_lm
 from mlx_lm.models.base import create_attention_mask
 
 from .config import FlashConfig
+from . import page_cache
 
 
 class FlashLLM(nn.Module):
@@ -32,6 +33,7 @@ class FlashLLM(nn.Module):
         object.__setattr__(self, "_post_layer_fn", self._build_post_layer_fn(model))
         object.__setattr__(self, "_layer_sigs", self._cache_layer_signatures())
         object.__setattr__(self, "disk_cache", None)
+        object.__setattr__(self, "mmap_cache", None)
     
     def _find_layers(self, model: nn.Module) -> list:
         """Find transformer layers via common attribute names."""
@@ -105,8 +107,22 @@ class FlashLLM(nn.Module):
         if mask is None and cache is not None:
             mask = create_attention_mask(h, cache)
             
+        # Pipelined synchronization tracker
+        pending_releases = []
+        pipeline_depth = getattr(self._config, 'pipeline_depth', 2)
+        
+        # Prime the async prefetch pump (prefetch N layers ahead)
+        if self.mmap_cache:
+            for p in range(pipeline_depth):
+                if p < self._n_layers:
+                    self.mmap_cache.prefetch_layer_background(p)
+            
         # Per-layer synchronous execution
         for i, layer in enumerate(self._layers):
+            # Enqueue the next layer outside of our current pipeline window
+            if self.mmap_cache and i + pipeline_depth < self._n_layers:
+                self.mmap_cache.prefetch_layer_background(i + pipeline_depth)
+                    
             cache_entry = cache[i] if cache is not None else None
             is_mamba, has_mask, has_cache = self._layer_sigs[i]
             
@@ -131,10 +147,21 @@ class FlashLLM(nn.Module):
                 else:
                     mx.eval(h)
             
-            # Synchronise: ensure GPU work is done before clearing cache
-            mx.synchronize()
+            # Queue this layer for release
+            if self.mmap_cache:
+                current_ranges = self.mmap_cache.get_layer_ranges(i)
+                pending_releases.append(current_ranges)
+            else:
+                pending_releases.append({})
             
-            # Release Metal pool memory
+            # If our pipeline queue is full, synchronize and release the oldest layer
+            if len(pending_releases) >= pipeline_depth:
+                mx.synchronize()
+                oldest_ranges = pending_releases.pop(0)
+                for mm, (start, end, _) in oldest_ranges.items():
+                    page_cache.release(mm, start, end - start, strategy=self._config.eviction_strategy)
+                    
+            # Release Metal pool memory (only releases what GPU has finished with, which is why we pipelined)
             mx.clear_cache()
             
             # Telemetry
@@ -196,15 +223,22 @@ class FlashGenerationLoop:
         if isinstance(model_or_path, (str, Path)):
             self.model, self.tokenizer = mlx_lm.load(str(model_or_path), lazy=True)[:2]  # type: ignore
             self.flash_model = FlashLLM(self.model, config)
+            # Initialize Mmap cache here
+            from .safetensors_mmap import SafetensorsMmapCache
+            self.flash_model.mmap_cache = SafetensorsMmapCache(model_or_path)
+            
         elif isinstance(model_or_path, FlashLLM):
             self.flash_model = model_or_path
             self.model = self.flash_model._model
             self.tokenizer = tokenizer
+            if not hasattr(self.flash_model, 'mmap_cache'):
+                self.flash_model.mmap_cache = None
         else:
             # Assume it is a base nn.Module from mlx_lm.load
             self.model = model_or_path
             self.tokenizer = tokenizer
             self.flash_model = FlashLLM(self.model, config)
+            self.flash_model.mmap_cache = None
             
         n_layers = self.flash_model._n_layers
         if self.config.debug:
