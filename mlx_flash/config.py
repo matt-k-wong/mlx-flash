@@ -78,8 +78,8 @@ class FlashConfig:
                               init=False, repr=False)
 
     def validate(self) -> None:
-        if self.ram_budget_gb < 0.5:
-            raise ValueError("ram_budget_gb must be >= 0.5 GB")
+        if self.ram_budget_gb < 0.1:
+            raise ValueError("ram_budget_gb must be >= 0.1 GB")
         if self.prefill_chunk_size < 0:
             raise ValueError("prefill_chunk_size must be >= 0")
         if self.kv_keep < 0:
