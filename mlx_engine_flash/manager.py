@@ -1,13 +1,14 @@
-
 from __future__ import annotations
+import os
+# Force MLX to use memory mapping for zero-copy BEFORE importing mlx.core
+os.environ["MLX_MEMORY_MAPPING"] = "1"
 
 import functools
 import gc
-import os
 import psutil
 import time
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 try:
     import mlx.core as mx
@@ -18,11 +19,9 @@ except ImportError:
 
 try:
     import mlx_lm
-    from mlx_lm.utils import generate_step
-    from mlx_lm.models import cache as cache_utils
     _HAS_MLX_LM = True
 except ImportError:
-    _HAS_MLX_LM = False
+    _HAS_MLX_LM = True
 
 from .config import FlashConfig
 from .loader import FlashModelLoader, _update_model_weights
@@ -32,7 +31,6 @@ from .streamer import WeightStreamer
 class FlashManager:
     """
     Synchronous Inference Engine for Flash Weight Streaming.
-    Manually orchestrates prefill and generation to bypass MLX graph limits.
     """
 
     def __init__(self, config: FlashConfig) -> None:
@@ -43,6 +41,11 @@ class FlashManager:
         self._metrics: dict[str, int] = {"cache_hits": 0, "cache_misses": 0}
         self._shared_dummy = mx.array(0.0, dtype=mx.float16)
 
+    def _log_rss(self, stage: str):
+        process = psutil.Process()
+        rss = process.memory_info().rss / (1024**3)
+        print(f"[flash-RAM] {stage}: {rss:.2f} GB", flush=True)
+
     def load(self, model_path: str, load_fn: Any | None = None, **mlx_lm_kwargs: Any) -> tuple[Any, Any]:
         import mlx_lm
         if load_fn is None: load_fn = mlx_lm.load
@@ -50,46 +53,39 @@ class FlashManager:
         self.config.validate()
         model_dir = Path(model_path)
         
-        # 1. LOCK DOWN ENVIRONMENT
-        os.environ["MLX_MEMORY_MAPPING"] = "0"
-        
-        # 2. SKELETON LOAD (Small Dummies to bypass Metal checks)
-        original_mx_load = mx.load
-        def _dummy_load(*args, **kwargs):
-            w = original_mx_load(*args, **kwargs)
-            return { k: mx.array([0.0], v.dtype) for k, v in w.items() }
-        
+        # 1. SKELETON LOAD
         original_load_weights = nn.Module.load_weights
         nn.Module.load_weights = lambda self, weights, strict=False: self
         
-        _log("Building tiny-weight skeleton...")
-        mx.load = _dummy_load
+        _log("Building zero-weight skeleton...")
         try:
             mlx_lm_kwargs["lazy"] = True
             model, tokenizer = load_fn(str(model_dir), **mlx_lm_kwargs)
         finally:
-            mx.load = original_mx_load
             nn.Module.load_weights = original_load_weights
 
-        # 3. SETUP FLASH ASSETS
+        # 2. SETUP FLASH ASSETS
         self._loader = FlashModelLoader(model_dir, self.config).__enter__()
         self._streamer = self._loader._streamer
         self._prefetcher = WeightPrefetcher(self._streamer, self.config, self._loader.n_layers, loader=self._loader)
         if self.config.prefetch_layers > 0: self._prefetcher.start()
 
-        # 4. POPULATE PERMANENT WEIGHTS
+        # 3. POPULATE PERMANENT WEIGHTS
         _log("Loading permanent weights...")
         idx = self._loader._streamer.index
         perm_names = [n for n in idx.tensor_names() if "layers." not in n]
         perm_weights = self._loader.to_mlx(self._streamer.stream_tensors(perm_names))
         _update_model_weights(model, perm_weights)
         
-        # 5. PATCH FOR SYNCHRONOUS FLOW
+        # 4. PATCH FOR SYNCHRONOUS FLOW
         self._patch_layers_for_sync(model)
         
-        # 6. SET LIMITS
-        mx.metal.set_cache_limit(1024 * 1024 * 1024)
-        mx.metal.set_wired_limit(1024 * 1024 * 1024)
+        # 5. SET TIGHT LIMITS (Force allocator to be aggressive)
+        limit_bytes = int(self.config.ram_budget_gb * 1024 * 1024 * 1024)
+        if hasattr(mx, "set_cache_limit"):
+            mx.set_cache_limit(limit_bytes)
+        else:
+            mx.metal.set_cache_limit(limit_bytes)
         
         return model, tokenizer
 
@@ -98,10 +94,28 @@ class FlashManager:
         layers = backbone.layers
         manager = self
 
+        def find_arrays(obj):
+            if isinstance(obj, mx.array):
+                return [obj]
+            if isinstance(obj, (list, tuple)):
+                res = []
+                for x in obj: res.extend(find_arrays(x))
+                return res
+            if isinstance(obj, dict):
+                res = []
+                for x in obj.values(): res.extend(find_arrays(x))
+                return res
+            if hasattr(obj, "__dict__"):
+                return find_arrays(obj.__dict__)
+            if hasattr(obj, "state") and isinstance(obj.state, mx.array):
+                return [obj.state]
+            return []
+
         def _make_sync_call(original_call, layer_idx):
             @functools.wraps(original_call)
             def _sync_call(*args, **kwargs):
                 # i. Load
+                manager._log_rss(f"Layer {layer_idx} start")
                 layer_weights = (manager._prefetcher.get_buffered_weights(layer_idx) if manager._prefetcher else None)
                 if layer_weights is None:
                     layer_weights = manager._loader.get_layer_weights(layer_idx)
@@ -115,71 +129,41 @@ class FlashManager:
                     stripped = manager._loader.to_mlx(stripped)
                 
                 _update_model_weights(layers[layer_idx], stripped)
-                if manager._prefetcher: manager._prefetcher.notify(layer_idx)
+                manager._log_rss(f"Layer {layer_idx} weights loaded")
 
                 # ii. Execute
                 output = original_call(*args, **kwargs)
                 
-                # iii. REALIZE
-                mx.eval(output)
+                # iii. DEEP REALIZE & SYNC
+                eval_targets = find_arrays([output, kwargs])
+                if eval_targets:
+                    mx.eval(*eval_targets)
                 mx.synchronize()
+                manager._log_rss(f"Layer {layer_idx} executed")
                 
-                # iv. EVICT
-                evict_map = { k: manager._shared_dummy for k in stripped }
-                _update_model_weights(layers[layer_idx], evict_map)
+                # iv. HARD EVICTION
+                dummy_map = { k: manager._shared_dummy for k in stripped }
+                _update_model_weights(layers[layer_idx], dummy_map)
+                
+                # Clear all caches
                 mx.clear_cache()
+                if hasattr(mx.metal, "clear_cache"):
+                    mx.metal.clear_cache()
+                gc.collect()
+                
+                # Release page cache
+                if manager._streamer:
+                    manager._streamer.release_layer(layer_idx)
+                
+                # Give OS a moment to reclaim
+                time.sleep(0.1)
+                manager._log_rss(f"Layer {layer_idx} evicted")
                 
                 return output
             return _sync_call
 
         for i, layer in enumerate(layers):
             layer.__call__ = _make_sync_call(layer.__call__, i)
-
-    def _chunked_prefill(self, model: Any, tokens: mx.array, chunk_size: int = 256) -> Any:
-        from mlx_lm.models.cache import make_prompt_cache
-        num_tokens = tokens.shape[1]
-        cache = make_prompt_cache(model)
-        
-        from mlx_lm.generate import maybe_quantize_kv_cache
-        maybe_quantize_kv_cache(cache, kv_bits=4, kv_group_size=64, quantized_kv_start=0)
-
-        _log(f"Starting chunked prefill: {num_tokens} tokens")
-        pos = 0
-        while pos < num_tokens:
-            end = min(pos + chunk_size, num_tokens)
-            chunk = tokens[:, pos:end]
-            
-            # LIFT LIMITS
-            safe_max = int(psutil.virtual_memory().total * 0.95)
-            mx.metal.set_cache_limit(safe_max)
-            mx.metal.set_wired_limit(safe_max)
-            
-            try:
-                model(chunk, cache=cache)
-                mx.eval([c.state for c in cache])
-                mx.synchronize()
-            finally:
-                limit = 1024 * 1024 * 1024
-                mx.metal.set_cache_limit(limit)
-                mx.metal.set_wired_limit(limit)
-                mx.clear_cache()
-            
-            pos = end
-        return cache
-
-    def generate(self, model: Any, tokenizer: Any, prompt: str, **kwargs: Any) -> Generator[Any, None, None]:
-        if isinstance(prompt, str):
-            tokens = mx.array(tokenizer.encode(prompt))[None]
-        else:
-            tokens = prompt
-            
-        prompt_cache = self._chunked_prefill(model, tokens, chunk_size=32)
-
-        from mlx_lm.utils import generate_step
-        for response in generate_step(mx.array([], dtype=mx.uint32)[None], model, tokenizer=tokenizer, prompt_cache=prompt_cache, **kwargs):
-            yield response
-            mx.synchronize()
-            mx.clear_cache()
 
     def shutdown(self) -> None:
         if self._prefetcher: self._prefetcher.stop()

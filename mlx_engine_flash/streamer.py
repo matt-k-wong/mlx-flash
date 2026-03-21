@@ -1,30 +1,14 @@
 """
-streamer.py — Parallel pread() weight streamer + safetensors lazy reader.
+streamer.py — Zero-copy memory-mapped weight streamer.
 
-Architecture
-------------
-ParallelPreader
-    Low-level: opens a file descriptor and issues multiple concurrent
-    pread() calls using a thread pool.  pread() is:
-      * Thread-safe (no shared seek position)
-      * GIL-releasing in CPython (I/O syscalls release the GIL)
-      * Zero-copy into bytes objects returned to caller
-
-SafetensorsIndex
-    Parses the safetensors header(s) for a model directory.  Builds a
-    complete map of tensor name → (file_path, byte_offset, byte_length,
-    dtype, shape).  Handles both single-file and sharded models.
-
-WeightStreamer
-    High-level: wraps ParallelPreader + SafetensorsIndex.  Provides
-    `stream_tensors(names)` which issues parallel reads and returns a
-    dict of NumPy arrays, ready to be wrapped in mx.array().
-    Also manages madvise prefetch/release via PageCacheRegion.
+This module provides zero-copy access to model weights by memory-mapping
+safetensors files and returning NumPy arrays that alias the mmap'd memory.
+This allows the OS to manage physical memory via the unified page cache,
+reclaiming pages on-demand after computation.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import mmap
 import os
@@ -99,32 +83,20 @@ def _parse_safetensors_header(path: Path) -> tuple[dict, int]:
 def _quant_bits(dtype_str: str) -> int:
     """Best-effort extraction of effective bit-width from dtype string."""
     lower = dtype_str.lower()
-    if "q2" in lower:
-        return 2
-    if "q3" in lower:
-        return 3
-    if "q4" in lower:
-        return 4
-    if "q5" in lower:
-        return 5
-    if "q6" in lower:
-        return 6
-    if "q8" in lower:
-        return 8
-    if lower in ("f16", "bf16"):
-        return 16
-    if lower == "f32":
-        return 32
-    return 8   # fallback
+    if "q2" in lower: return 2
+    if "q3" in lower: return 3
+    if "q4" in lower: return 4
+    if "q5" in lower: return 5
+    if "q6" in lower: return 6
+    if "q8" in lower: return 8
+    if lower in ("f16", "bf16"): return 16
+    if lower == "f32": return 32
+    return 8
 
 
 class SafetensorsIndex:
     """
     Index of all tensors across one or more safetensors shards.
-
-    Handles:
-    * Single-file models  (*.safetensors)
-    * Sharded models      (model.safetensors.index.json + shards)
     """
 
     def __init__(self, model_dir: Path) -> None:
@@ -140,32 +112,25 @@ class SafetensorsIndex:
         if index_path.exists():
             self._load_sharded(index_path)
         else:
-            # Find all .safetensors files
             shards = sorted(self.model_dir.glob("*.safetensors"))
             if not shards:
-                raise FileNotFoundError(
-                    f"No .safetensors files found in {self.model_dir}"
-                )
+                raise FileNotFoundError(f"No .safetensors files found in {self.model_dir}")
             for shard in shards:
                 self._index_shard(shard)
-        
-        # Auto-detect layer prefix
         self._layer_prefix = self._detect_layer_prefix()
 
     def _detect_layer_prefix(self) -> str:
-        """Heuristically find the common prefix for transformer layers."""
         for n in self._entries:
             if ".layers.0." in n:
                 return n.split(".layers.0.")[0] + ".layers.0."
             if "layers.0." in n:
                 return "layers.0."
-        return "model.layers.0." # Fallback
+        return "model.layers.0."
 
     def _load_sharded(self, index_path: Path) -> None:
         idx = json.loads(index_path.read_text())
         weight_map: dict[str, str] = idx.get("weight_map", {})
         shards_needed = set(weight_map.values())
-        # Build per-shard header → entries
         shard_headers: dict[str, tuple[dict, int]] = {}
         for shard_name in shards_needed:
             shard_path = self.model_dir / shard_name
@@ -178,38 +143,32 @@ class SafetensorsIndex:
                 continue
             meta = header[tensor_name]
             start, end = meta["data_offsets"]
-            dtype_str = meta["dtype"]
-            shape = tuple(meta["shape"])
             self._entries[tensor_name] = TensorEntry(
                 name=tensor_name,
                 file_path=self.model_dir / shard_name,
                 data_offset=data_start + start,
                 data_length=end - start,
-                dtype=dtype_str,
-                shape=shape,
-                n_bits=_quant_bits(dtype_str),
+                dtype=meta["dtype"],
+                shape=tuple(meta["shape"]),
+                n_bits=_quant_bits(meta["dtype"]),
             )
 
     def _index_shard(self, shard_path: Path) -> None:
         header, data_start = _parse_safetensors_header(shard_path)
         for tensor_name, meta in header.items():
-            if tensor_name == "__metadata__":
-                continue
+            if tensor_name == "__metadata__": continue
             start, end = meta["data_offsets"]
-            dtype_str = meta["dtype"]
-            shape = tuple(meta["shape"])
             self._entries[tensor_name] = TensorEntry(
                 name=tensor_name,
                 file_path=shard_path,
                 data_offset=data_start + start,
                 data_length=end - start,
-                dtype=dtype_str,
-                shape=shape,
-                n_bits=_quant_bits(dtype_str),
+                dtype=meta["dtype"],
+                shape=tuple(meta["shape"]),
+                n_bits=_quant_bits(meta["dtype"]),
             )
 
     def open_mmaps(self) -> None:
-        """Open memory-mapped views of all shard files (lazy)."""
         files_needed = {e.file_path for e in self._entries.values()}
         for path in files_needed:
             if path not in self._fds:
@@ -217,18 +176,14 @@ class SafetensorsIndex:
                 self._fds[path] = fd
                 mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
                 self._mmaps[path] = mm
-                # Hint: sequential access for the whole file during model loading
                 set_sequential(mm, 0, mm.size())
 
     def close_mmaps(self) -> None:
         import contextlib
         for mm in self._mmaps.values():
-            with contextlib.suppress(BufferError):
-                # Occurs if zero-copy arrays are still alive (e.g. in tests)
-                mm.close()
+            with contextlib.suppress(BufferError): mm.close()
         for fd in self._fds.values():
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            with contextlib.suppress(OSError): os.close(fd)
         self._mmaps.clear()
         self._fds.clear()
 
@@ -238,40 +193,32 @@ class SafetensorsIndex:
     def __getitem__(self, name: str) -> TensorEntry:
         return self._entries[name]
 
-    def get(self, name: str) -> TensorEntry | None:
-        return self._entries.get(name)
+    def get_mmap(self, path: Path) -> mmap.mmap:
+        with self._lock:
+            if path not in self._mmaps: self.open_mmaps()
+        return self._mmaps[path]
 
-    def tensor_names(self) -> list[str]:
-        return list(self._entries.keys())
+    def tensor_names(self) -> list[str]: return list(self._entries.keys())
 
     def layer_tensor_names(self, layer_idx: int) -> list[str]:
-        """Return all tensor names belonging to transformer layer *layer_idx*."""
         prefix = self._layer_prefix.replace(".layers.0.", f".layers.{layer_idx}.")
         if "layers.0." in self._layer_prefix and not self._layer_prefix.startswith("."):
              prefix = self._layer_prefix.replace("layers.0.", f"layers.{layer_idx}.")
         return [n for n in self._entries if n.startswith(prefix)]
 
     def expert_tensor_names(self, layer_idx: int, expert_idx: int) -> list[str]:
-        """Return tensor names for a specific MoE expert."""
         prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
         return [n for n in self._entries if n.startswith(prefix)]
 
-    def get_mmap(self, path: Path) -> mmap.mmap:
-        with self._lock:
-            if path not in self._mmaps:
-                self.open_mmaps()
-        return self._mmaps[path]
-
     @property
     def n_layers(self) -> int:
-        """Heuristic: count unique layer indices."""
         idxs = set()
         for name in self._entries:
             parts = name.split(".")
             for i, p in enumerate(parts):
                 if p == "layers" and i + 1 < len(parts):
-                    with contextlib.suppress(ValueError):
-                        idxs.add(int(parts[i + 1]))
+                    try: idxs.add(int(parts[i + 1]))
+                    except ValueError: pass
         return max(idxs) + 1 if idxs else 0
 
     @property
@@ -280,146 +227,66 @@ class SafetensorsIndex:
         return min(bits) if bits else 16
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MmapReader:
-    """
-    Reader that creates memory-mapped slices of files.
-    
-    This provides 'Zero-Copy' access to weights:
-    * The OS maps the file into the process's address space.
-    * No data is copied from the OS into a process-local buffer.
-    * When madvise(MADV_FREE) is called, the OS immediately knows it
-      can reclaim the physical pages from this process.
-    """
-
-    def __init__(self, index: SafetensorsIndex) -> None:
-        self.index = index
-
-    def read_one(self, path: Path, offset: int, size: int) -> memoryview:
-        mm = self.index.get_mmap(path)
-        # Returns a zero-copy memoryview of the mmap'd region
-        return memoryview(mm)[offset: offset + size]
-
-    def read_many(
-        self,
-        path: Path,
-        requests: list[tuple[int, int]],  # (offset, size)
-    ) -> list[memoryview]:
-        # mmap-based 'reads' are just slice operations; no threads needed
-        # as the actual I/O happens on-demand via page faults.
-        return [self.read_one(path, off, sz) for off, sz in requests]
-
-    def close(self) -> None:
-        pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
 class WeightStreamer:
     """
-    High-level weight streamer: reads tensors by name from safetensors shards.
+    Zero-copy weight streamer.
 
-    Uses MmapReader to provide zero-copy memory regions backed by the
-    macOS Unified Page Cache.
+    WARNING: Returned arrays alias mmap memory. Do not close the WeightStreamer
+    while any returned array is still referenced.
     """
 
     def __init__(self, model_dir: Path, config: FlashConfig) -> None:
         self.config = config
         self.index = SafetensorsIndex(model_dir)
         self.index.open_mmaps()
-        self._reader = MmapReader(self.index)
 
     def stream_tensor(self, name: str) -> np.ndarray:
-        """Read one tensor synchronously; returns a NumPy array."""
-        entry = self.index[name]
-        raw = self._reader.read_one(entry.file_path, entry.data_offset, entry.data_length)
-        return self._decode(entry, raw)
+        entry = self.index._entries[name]
+        mm = self.index.get_mmap(entry.file_path)
+        return self._decode(entry, mm)
 
-    def stream_tensors(
-        self,
-        names: list[str],
-        prefetch_names: list[str] | None = None,
-    ) -> dict[str, np.ndarray]:
-        """
-        Read *names* in parallel (via page faults).
-        Optionally issues a prefetch hint for *prefetch_names* (next layer).
-        """
-        # Issue prefetch hint for next batch before reading current
+    def stream_tensors(self, names: list[str], prefetch_names: list[str] | None = None) -> dict[str, np.ndarray]:
         if prefetch_names:
             for n in prefetch_names:
-                entry = self.index.get(n)
-                if entry is not None:
+                entry = self.index._entries.get(n)
+                if entry:
                     mm = self.index.get_mmap(entry.file_path)
                     prefetch(mm, entry.data_offset, entry.data_length)
 
-        # Build per-file batches
-        by_file: dict[Path, list[tuple[str, int, int]]] = {}
-        for name in names:
-            entry = self.index.get(name)
-            if entry is None:
-                continue
-            by_file.setdefault(entry.file_path, []).append(
-                (name, entry.data_offset, entry.data_length)
-            )
-
-        results: dict[str, np.ndarray] = {}
-        for fpath, batch in by_file.items():
-            tensor_names = [b[0] for b in batch]
-            requests = [(b[1], b[2]) for b in batch]
-            raw_list = self._reader.read_many(fpath, requests)
-            for tname, raw in zip(tensor_names, raw_list, strict=False):
-                entry = self.index[tname]
-                results[tname] = self._decode(entry, raw)
-
-        return results
+        return {name: self.stream_tensor(name) for name in names if name in self.index._entries}
 
     def prefetch_layer(self, layer_idx: int) -> None:
-        """Issue async page-cache prefetch for all weights in layer *layer_idx*."""
         for name in self.index.layer_tensor_names(layer_idx):
-            entry = self.index.get(name)
-            if entry is not None:
+            entry = self.index._entries.get(name)
+            if entry:
                 mm = self.index.get_mmap(entry.file_path)
                 prefetch(mm, entry.data_offset, entry.data_length)
 
     def release_layer(self, layer_idx: int) -> None:
-        """Release page-cache pages for layer *layer_idx*."""
         for name in self.index.layer_tensor_names(layer_idx):
-            entry = self.index.get(name)
-            if entry is not None:
+            entry = self.index._entries.get(name)
+            if entry:
                 mm = self.index.get_mmap(entry.file_path)
-                release(mm, entry.data_offset, entry.data_length,
-                        self.config.eviction_strategy)
+                release(mm, entry.data_offset, entry.data_length, self.config.eviction_strategy)
 
-    def prefetch_experts(self, layer_idx: int, expert_idxs: list[int]) -> None:
-        """Prefetch only the specified MoE experts for a layer."""
-        for eidx in expert_idxs:
-            for name in self.index.expert_tensor_names(layer_idx, eidx):
-                entry = self.index.get(name)
-                if entry is not None:
-                    mm = self.index.get_mmap(entry.file_path)
-                    prefetch(mm, entry.data_offset, entry.data_length)
-
-    @staticmethod
-    def _decode(entry: TensorEntry, raw: bytes) -> np.ndarray:
-        """Convert raw bytes → NumPy array according to tensor dtype/shape."""
+    def _decode(self, entry: TensorEntry, mm: mmap.mmap) -> np.ndarray:
+        """Returns a zero-copy NumPy array slicing into the mmap."""
+        mm_view = memoryview(mm)[entry.data_offset : entry.data_offset + entry.data_length]
+        
         if entry.dtype in _QUANTISED_DTYPES:
-            # Return raw uint8 for quantised blobs; dequant happens on-GPU
-            return np.frombuffer(raw, dtype=np.uint8)
+            return np.frombuffer(mm_view, dtype=np.uint8)
+        
         np_dtype = _ST_DTYPE_MAP.get(entry.dtype)
         if np_dtype is None:
             raise ValueError(f"Unknown dtype {entry.dtype!r} for tensor {entry.name!r}")
-        arr = np.frombuffer(raw, dtype=np_dtype)
+            
+        arr = np.frombuffer(mm_view, dtype=np_dtype)
         if entry.shape:
             arr = arr.reshape(entry.shape)
         return arr
 
     def close(self) -> None:
-        self._reader.close()
         self.index.close_mmaps()
 
-    def __enter__(self) -> WeightStreamer:
-        return self
-
-    def __exit__(self, *_) -> None:
-        self.close()
+    def __enter__(self) -> WeightStreamer: return self
+    def __exit__(self, *_) -> None: self.close()

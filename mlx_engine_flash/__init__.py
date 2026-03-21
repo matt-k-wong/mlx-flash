@@ -21,13 +21,12 @@ Or via Modelfile:
 from .config import FlashConfig
 from .loader import FlashModelLoader
 from .manager import FlashManager
-from .streamer import MmapReader, WeightStreamer
+from .streamer import WeightStreamer
 
 __all__ = [
     "FlashConfig",
     "FlashManager",
     "FlashModelLoader",
-    "MmapReader",
     "WeightStreamer",
 ]
 

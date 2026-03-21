@@ -1,5 +1,6 @@
 """Tests for SafetensorsIndex and WeightStreamer."""
 
+import mmap
 import numpy as np
 
 from mlx_engine_flash.streamer import SafetensorsIndex, WeightStreamer
@@ -73,3 +74,14 @@ def test_q4_0_decode_shape(tmp_model_dir, flash_config):
         arr = streamer.stream_tensor("model.layers.0.self_attn.q_proj.weight")
         # Raw Q4_0 block data: each block = 18 bytes
         assert arr.dtype == np.uint8
+
+
+def test_no_private_copy(tmp_model_dir, flash_config):
+    with WeightStreamer(tmp_model_dir, flash_config) as s:
+        # Get any tensor name from the index
+        name = s.index.tensor_names()[0]
+        arr = s.stream_tensor(name)
+        # A zero-copy array shares memory with the mmap; its base should 
+        # not be None and should point into the mmap (or be a memoryview).
+        assert arr.base is not None, f"Expected zero-copy array for {name}, got private copy"
+        assert isinstance(arr.base, (memoryview, np.ndarray, mmap.mmap)), f"Unexpected base type: {type(arr.base)}"

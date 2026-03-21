@@ -21,7 +21,6 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
 
     try:
         import mlx_lm
-        import mlx.core as mx
     except ImportError as e:
         raise ImportError("mlx_lm not installed") from e
 
@@ -29,14 +28,9 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
         if _MANAGER is not None: _MANAGER.config = config
         return
 
-    # LOCK DOWN METAL LIMITS
-    mx.metal.set_cache_limit = lambda *args, **kwargs: None
-    mx.metal.set_wired_limit = lambda *args, **kwargs: None
-
     _ORIGINAL_LOAD = mlx_lm.load
     _MANAGER = FlashManager(config)
 
-    # 1. Patch LOAD
     @functools.wraps(_ORIGINAL_LOAD)
     def _patched_load(model: str, *args: Any, **kwargs: Any) -> Any:
         should_flash = _should_use_flash(model, config)
@@ -46,17 +40,19 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
 
     mlx_lm.load = _patched_load
 
-    # 2. Patch stream_generate with PRODUCTION GUARDRAILS
+    # === PRODUCTION GUARDRAILS (Option 1 - stable & honest) ===
     def _flash_stream_generate(model, tokenizer, prompt, *args, **kwargs):
-        """Stable entry point with hard guardrails against Metal OOM."""
+        """Stable entry point that respects the documented prefill limitation."""
         import mlx.core as mx
         from mlx_lm.generate import generate_step
 
-        # Enforce basic safety
-        kwargs.setdefault("prefill_step_size", 1)
+        # Basic safety (keeps your existing low-RAM behavior)
+        # We MUST use prefill_step_size=1 for large models on base Macs
+        # to prevent 'GPU Timeout Error' during the prefill phase.
+        kwargs["prefill_step_size"] = 1
         kwargs.setdefault("kv_bits", 4)
 
-        # 1. ALWAYS Encode prompt to tokens for reliable chunking
+        # 1. Encode prompt to tokens
         if isinstance(prompt, str):
             token_list = tokenizer.encode(prompt)
         else:
@@ -66,35 +62,35 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
 
         # 2. APPLY GUARDRAIL
         current_config = _MANAGER.config if _MANAGER else config
-        if original_len > current_config.max_safe_context_tokens and current_config.strict_guardrails:
-            safe_len = current_config.max_safe_context_tokens
-            print(f"\n[mlx-flash] ⚠️  GUARDRAIL ACTIVATED")
-            print(f"   Prompt length: {original_len} tokens → truncated to last {safe_len} tokens")
-            print(f"   Reason: Large model + long prompt exceeds Metal graph limits on 16 GB Mac")
-            print(f"   Recommendation: For full long-context (2k+ tokens) use llama.cpp (GGUF) instead")
-            print(f"   (This is the documented limitation of current MLX — not a bug in mlx-flash)\n")
+        if original_len > current_config.max_safe_prefill_tokens and current_config.enable_prefill_guardrail:
+            safe_len = current_config.max_safe_prefill_tokens
+            print(f"\n[mlx-flash] ⚠️  PRE-FILL GUARDRAIL ACTIVATED")
+            print(f"   Prompt: {original_len} tokens → using last {safe_len} tokens")
+            print(f"   Reason: MLX builds full KV cache graph during prefill (see README 'Known Limitations')")
+            print(f"   Recommendation: For true 2k+ context use llama.cpp GGUF backend instead")
+            print(f"   (This is expected behavior for 30B-class models on 16 GB Macs)\n")
             token_list = token_list[-safe_len:]
 
-        # 3. Create a Response-like wrapper to match mlx_lm.stream_generate
+        # Create a Response wrapper
         class Response:
             def __init__(self, text, token):
                 self.text = text
                 self.token = token
 
-        # Convert back to MLX array for generate_step
+        # Convert to MLX array
         tokens_mx = mx.array(token_list)
 
-        # 4. Filter kwargs for generate_step
+        # Filter kwargs
         valid_args = {
             "max_tokens", "sampler", "logits_processors", "max_kv_size",
             "prompt_cache", "prefill_step_size", "kv_bits", "kv_group_size"
         }
         gen_kwargs = {k: v for k, v in kwargs.items() if k in valid_args}
 
-        # 5. Execute generation
         for token, _ in generate_step(tokens_mx, model, **gen_kwargs):
             text = tokenizer.decode([token.item()])
             yield Response(text, token.item())
+            # Synchronous engine will handle layer sync, but we sync token too
             mx.synchronize()
             mx.clear_cache()
 
