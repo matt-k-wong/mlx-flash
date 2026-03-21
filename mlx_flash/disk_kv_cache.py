@@ -2,7 +2,7 @@ import contextlib
 import json
 import struct
 from pathlib import Path
-from typing import Any, IO, Optional, cast
+from typing import IO, cast
 
 import mlx.core as mx
 import numpy as np
@@ -43,20 +43,20 @@ class DiskKVCache(KVCache):
         self.offset = 0
         self.header_pad_size = 8192  # 8 KB padded header is plenty
 
-        self.fd_k: Optional[IO[bytes]] = None
-        self.fd_v: Optional[IO[bytes]] = None
+        self.fd_k: IO[bytes] | None = None
+        self.fd_v: IO[bytes] | None = None
 
-        self.k_dtype_str: Optional[str] = None
-        self.k_shape: Optional[tuple[int, ...]] = None
-        self.v_shape: Optional[tuple[int, ...]] = None
+        self.k_dtype_str: str | None = None
+        self.k_shape: tuple[int, ...] | None = None
+        self.v_shape: tuple[int, ...] | None = None
         self.bytes_per_elem = 2
         self._max_tokens = max_tokens
         self._closed = False
         self._exit_stack = contextlib.ExitStack()
 
         # Satisfy KVCache contract: keys/values are None until first update
-        self.keys: Optional[mx.array] = None
-        self.values: Optional[mx.array] = None
+        self.keys: mx.array | None = None
+        self.values: mx.array | None = None
 
     # ── Resource Management ─────────────────────────────────────────────────
 
