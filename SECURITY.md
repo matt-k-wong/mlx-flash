@@ -11,7 +11,7 @@ Flash Mode is maintained as a security-critical component of the MLX inference e
 
 ## Reporting a Vulnerability
 
-If you identify a security vulnerability in `mlx-flash`, please do not open a public issue. Instead, send a detailed report to **[your-email@example.com]**. We will acknowledge your report within 48 hours and provide a timeline for a fix.
+If you identify a security vulnerability in `mlx-flash`, please do not open a public issue. Instead, send a detailed report to **[support@mlx-flash.local]**. We will acknowledge your report within 48 hours and provide a timeline for a fix.
 
 ## Model Safety
 

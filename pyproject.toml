@@ -8,43 +8,14 @@ version = "0.1.0"
 description = "Flash Weight Streaming (low-RAM mode) for LM Studio / mlx-engine"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11"
-keywords = ["mlx", "llm", "apple-silicon", "flash-attention", "moe", "lm-studio"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: MacOS",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
-dependencies = [
-    "mlx>=0.16.0",
-    "mlx-lm>=0.20.0",
-    "numpy>=1.26",
-    "huggingface-hub>=0.23",
-    "psutil>=5.9",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.4",
-    "mypy>=1.10",
-    "types-setuptools",
-    "pytest-cov",
-]
-metal = [
-    # Metal compilation deps are system-level (xcrun metallib); nothing extra on PyPI
+authors = [
+    { name = "Matt Wong", email = "matt@example.com" },
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/mlx-flash"
-Repository = "https://github.com/YOUR_USERNAME/mlx-flash"
-Issues = "https://github.com/YOUR_USERNAME/mlx-flash/issues"
+Homepage = "https://github.com/matt-k-wong/mlx-flash"
+Repository = "https://github.com/matt-k-wong/mlx-flash"
+Issues = "https://github.com/matt-k-wong/mlx-flash/issues"
 
 [project.scripts]
 flash-monitor = "mlx_flash.monitor:run_monitor"
