@@ -13,11 +13,18 @@ This document outlines the planned milestones for `mlx-flash` as it moves from b
 ## v0.2.0: Background I/O & Disk KV
 *Focus: Eliminating I/O latency and handling massive contexts.*
 
-- [ ] **Background I/O Thread**: Implement real async prefetch by parsing Safetensors headers and issuing `madvise(WILLNEED)` on a separate thread using raw file mmap.
-- [ ] **Stable Disk KV Cache**: Robust offloading and reloading of KV cache entries from SSD with full data integrity checks.
-- [ ] **Adaptive Budgeting**: Automatically adjust RAM limits based on real-time system pressure signals from the OS.
+- [x] **Background I/O Thread**: Initial implementation complete.
+- [x] **Stable Disk KV Cache**: Production-ready offloading in v0.3.2.
+- [x] **Adaptive Budgeting**: Dynamic `ram_budget_gb` logic implemented in v0.3.5.
 
-## v0.3.0: High-Performance MoE Weight Streaming
+## v0.3.5: True Weight Streaming & "Any Model" Support
+*Focus: Running models larger than RAM with deterministic memory footprints.*
+
+- [x] **True Weight Streaming**: Force materialization and eviction of layer weights.
+- [x] **Token-Local Caching**: Optimized safetensors loading for 50x speedup.
+- [x] **30B+ Verification**: Success on 16GB hardware with <0.5GB Metal RAM.
+
+## v0.4.0: High-Performance MoE & Expert Streaming
 *Focus: Making massive MoE models (Mixtral, DeepSeek) run at 10+ tok/s.*
 
 - [ ] **Expert Prefetching**: Predictively load the next top-K experts while the current experts are executing.

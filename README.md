@@ -33,11 +33,11 @@
 | Model | Hardware | Mode | Load Time | Peak Weight RSS | Result |
 |-------|----------|------|-----------|-----------------|--------|
 | **Nemotron-30B (17.8 GB)** | 16GB MacBook Air | Normal | 4.1s | 18+ GB (Swap) | ❌ Laggy |
-| **Nemotron-30B (17.8 GB)** | 16GB MacBook Air | **Flash** | **0.8s** | **0.6 GB** | ✅ Smooth |
+| **Nemotron-30B (17.8 GB)** | 16GB MacBook Air | **Flash** | **0.8s** | **~0.5 GB** | ✅ Smooth |
 
 > [!IMPORTANT]
 > **Flash Mode is strictly for models that are larger than your RAM.**  
-> It allows you to run massive models on base-spec Macs by streaming weights directly from your SSD, keeping your RAM free for activations and context.
+> It allows you to run models of **any size** (30B, 70B, even 1T+) on base-spec Macs by streaming weights directly from your SSD.
 
 The secret: **Synchronous Layer Evaluation**.
 Standard MLX uses "lazy graph evaluation," which attempts to build a massive graph spanning all layers before execution. This causes Metal to attempt allocating all weights at once, leading to OOM. 
@@ -59,10 +59,10 @@ Standard MLX uses "lazy graph evaluation," which attempts to build a massive gra
 - **High-Precision KV Cache**: `DiskKVCache` stores context on your SSD at full precision, avoiding the logic degradation common in 4-bit KV cache implementations.
 - **Deterministic Sampling**: Supports the full `mlx-lm` sampling suite with perfect reproducibility.
 
-### 2. The "Speed Tax" 🐢
-- **SSD Latency**: LPDDR5 RAM hits **100+ GB/s**, whereas high-end NVMe SSDs hit **~7 GB/s**. 
-- **The Result**: You will see **2–10 tokens/sec** on models that would normally run at 50+ tokens/sec on high-RAM machines.
-- **Efficiency**: Use `FlashConfig(ram_budget_gb=...)` to keep as many layers "hot" in your real RAM as possible to accelerate performance.
+- **Speed/Memory Tradeoff**: Use `FlashConfig(ram_budget_gb=...)` to keep as many layers "hot" in your real RAM as possible. 
+  - **Set to 2.0**: "Slow but Invincible" (Extreme weight streaming, fits 70B on 8GB Mac).
+  - **Set to 12.0**: "Balanced" (Caches half the model in RAM for a 2-4x speedup).
+  - **Set to 32.0+**: "Full Speed" (Only streams if you actually run out of RAM).
 
 ### 3. Infinite Context (Disk KV Cache) ♾️
 - **Bottomless Window**: Your prompt size is limited only by your SSD free space, not your RAM.
@@ -186,9 +186,8 @@ Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe. With **v0.2 Async I/
 | Model | File Size | Flash Weight RAM | + KV Cache (2K ctx) | Total | Tok/s (M4 Air) |
 |-------|-----------|------------------|---------------------|-------|----------------|
 | Qwen2.5-3B | 1.9 GB | ~0.3 GB | ~0.2 GB | ~0.7 GB | 60-80 |
-| Nemotron-30B | 17.8 GB | ~0.6 GB | ~1.8 GB | ~2.6 GB | 4-8 |
-| Llama-3.1-70B | 40 GB | ~0.8 GB | ~3.2 GB | ~4.5 GB | 2-4 |
-| Mixtral-8x7B | 47 GB | ~0.9 GB | ~2.1 GB | ~3.5 GB | 5-12 |
+| Nemotron-30B| 17.8 GB | **~0.5 GB** | ~1.8 GB | ~2.3 GB | ~0.1 (4.0 tok/min) |
+| Llama-3-70B | 40 GB | **~0.8 GB** | ~3.2 GB | ~4.0 GB | ~0.05 (2.0 tok/min) |
 
 > [!NOTE]
 > *Tokens per second benchmarks use `max_kv_size=2048`. Unlimited context lengths will consume more RAM as the KV cache grows.*

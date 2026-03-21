@@ -54,13 +54,54 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
         object.__setattr__(model, "manager", mgr)
         return model, tokenizer
 
+    # Patch GENERATE for Disk KV injection
+    _ORIGINAL_STREAM_GEN = mlx_lm.stream_generate
+    _ORIGINAL_GEN = mlx_lm.generate
+
+    def _flash_stream_generate(*args, **kwargs):
+        model = args[0] if len(args) > 0 else kwargs.get("model")
+        if hasattr(model, "manager") and config.disk_kv_enabled:
+            # Inject Disk KV
+            from ..disk_kv_cache import DiskKVCache
+            from mlx_lm.models.cache import make_prompt_cache
+            
+            if "prompt_cache" not in kwargs:
+                # We need to create the cache ourselves to use DiskKVCache
+                # 1. Use the model's native cache creation as a template
+                from mlx_lm.models.cache import make_prompt_cache
+                native_cache = make_prompt_cache(model)
+                
+                kv_dir = config.disk_kv_dir or "/tmp/mlx_flash_kv"
+                max_tokens = config.kv_keep if config.kv_keep > 0 else None
+                
+                # 2. Only replace Attention-style caches (KVCache) with DiskKVCache
+                from ..disk_kv_cache import DiskKVCache
+                from mlx_lm.models.cache import KVCache
+                
+                final_cache = []
+                for i, c in enumerate(native_cache):
+                    # Nemotron hybrid uses ArraysCache for Mamba, KVCache for Attention.
+                    # We only want to swap the KVCache (which grows over time).
+                    name = c.__class__.__name__
+                    if "KVCache" in name and "ArraysCache" not in name:
+                        final_cache.append(DiskKVCache(i, cache_dir=kv_dir, max_tokens=max_tokens))
+                    else:
+                        final_cache.append(c)
+                
+                kwargs["prompt_cache"] = final_cache
+                
+        return _ORIGINAL_STREAM_GEN(*args, **kwargs)
+
     mlx_lm.load = _flash_load  # type: ignore
+    mlx_lm.stream_generate = _flash_stream_generate # type: ignore
+    mlx_lm.generate = _ORIGINAL_GEN # type: ignore
 
 
 def remove_flash_patch() -> None:
     """Restore the original state."""
     global _ORIGINAL_LOAD
     global _ORIGINAL_SET_CACHE_LIMIT, _ORIGINAL_SET_WIRED_LIMIT
+    global _ORIGINAL_STREAM_GEN, _ORIGINAL_GEN
     
     if _ORIGINAL_LOAD is None:
         return

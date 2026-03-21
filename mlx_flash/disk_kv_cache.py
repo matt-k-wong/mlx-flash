@@ -91,11 +91,10 @@ class DiskKVCache(KVCache):
         self.fd_k = open(self.k_path, "wb+")
         self.fd_v = open(self.v_path, "wb+")
 
-        self.k_dtype_str = "F16" if dtype == mx.float16 else "F32"
-        if dtype == mx.bfloat16:
-            self.k_dtype_str = "BF16"
-
-        self.bytes_per_elem = 2 if "16" in self.k_dtype_str else 4
+        # Force F32 for disk storage to avoid NumPy/MLX buffer protocol issues
+        # with float16/bfloat16.
+        self.k_dtype_str = "F32"
+        self.bytes_per_elem = 4
         self.k_shape = k_shape
         self.v_shape = v_shape
 
@@ -190,12 +189,15 @@ class DiskKVCache(KVCache):
         k_t = keys.transpose(2, 0, 1, 3)
         v_t = values.transpose(2, 0, 1, 3)
 
-        # 2. Evaluate and write to disk (via tobytes for simplicity)
-        # Note: after mx.eval(), the data lives in unified memory and is ready to write.
-        # np.asarray().tobytes() avoids the np.array() copy that forced synchronization.
-        mx.eval(k_t, v_t)
-        k_bytes = np.asarray(k_t).tobytes()
-        v_bytes = np.asarray(v_t).tobytes()
+        # 2. Evaluate and write to disk
+        # Use float32 for the temporary bytes conversion to avoid NumPy buffer alignment
+        # issues often seen with float16/bfloat16 on some systems.
+        k_t_f32 = k_t.astype(mx.float32)
+        v_t_f32 = v_t.astype(mx.float32)
+        mx.eval(k_t_f32, v_t_f32)
+        
+        k_bytes = np.asarray(k_t_f32).tobytes()
+        v_bytes = np.asarray(v_t_f32).tobytes()
 
         # 3. Append physical bytes (data first — crash-safe ordering)
         self.fd_k.seek(0, 2)

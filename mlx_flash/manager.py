@@ -100,7 +100,7 @@ class FlashManager:
         model, self.tokenizer = loader(str(path), lazy=True)[:2]  # type: ignore
         
         # 3. Wrap in Flash execution engine
-        self.model = FlashLLM(model, self.config)
+        self.model = FlashLLM(model, self.config, model_path=path)
         
         try:
             from .safetensors_mmap import SafetensorsMmapCache
@@ -146,6 +146,6 @@ class FlashManager:
         self.tokenizer = None
         
         # 4. Clear Metal cache
-        mx.metal.clear_cache()
+        mx.clear_cache()
 
 __all__ = ["FlashManager"]
