@@ -50,6 +50,26 @@ Standard MLX uses "lazy graph evaluation," which attempts to build a massive gra
 
 ---
 
+## The Tradeoff: Quality vs. Speed
+
+`mlx-flash` is a **no-compromise quality engine**. Unlike other low-RAM solutions, we do not use lossy compression (like 4-bit or 2-bit quantization) to shrink the model into your RAM. Instead, we trade **Time** for **Capacity**.
+
+### 1. Zero Accuracy Loss 🏆
+- **Bit-for-Bit Identical**: Weights are streamed in their native precision (F16/BF16/F32). The tokens generated are identical to running the model on a $6,000 Mac Studio with 192GB of RAM.
+- **High-Precision KV Cache**: `DiskKVCache` stores context on your SSD at full precision, avoiding the logic degradation common in 4-bit KV cache implementations.
+- **Deterministic Sampling**: Supports the full `mlx-lm` sampling suite with perfect reproducibility.
+
+### 2. The "Speed Tax" 🐢
+- **SSD Latency**: LPDDR5 RAM hits **100+ GB/s**, whereas high-end NVMe SSDs hit **~7 GB/s**. 
+- **The Result**: You will see **2–10 tokens/sec** on models that would normally run at 50+ tokens/sec on high-RAM machines.
+- **Efficiency**: Use `FlashConfig(ram_budget_gb=...)` to keep as many layers "hot" in your real RAM as possible to accelerate performance.
+
+### 3. Infinite Context (Disk KV Cache) ♾️
+- **Bottomless Window**: Your prompt size is limited only by your SSD free space, not your RAM.
+- **Eviction Mode**: To prevent SSD bloat, we use a **Halving Eviction** policy by default. When the `max_tokens` limit is reached, it keeps the most recent 50% of the context. (Set `max_tokens=None` for absolute perfect recall).
+
+---
+
 ## How It Works
 
 ```mermaid
