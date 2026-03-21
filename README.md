@@ -55,21 +55,24 @@ Standard MLX uses "lazy graph evaluation," which attempts to build a massive gra
 ```mermaid
 graph TD
     A[SSD: .safetensors] --"mmap(lazy=True)"--> B[MLX Lazy Arrays]
+    A --"Background Thread"--> P[os.pread]
+    P --"Force OS Page Cache"--> B
     B --"FlashLLM Wrapper"--> C{Forward Pass}
     subgraph "Per-Layer Loop"
         C --"Layer i"--> D[mx.eval]
         D --"Sync GPU"--> E[mx.synchronize]
         E --"Free Metal Pool"--> F[mx.metal.clear_cache]
-        F --"Next Layer"--> C
+        F --"MADV_FREE"--> G[Release RAM]
+        G --"Next Layer"--> C
     end
-    C --"Final Output"--> G[Token]
+    C --"Final Output"--> G2[Token]
 ```
 
 ### The Mechanism
 1. **Lazy Loading**: `mlx_lm.load(path, lazy=True)` maps the entire model into the unified address space using the macOS page cache. No Metal RAM is consumed at this point.
-2. **Perfect Proxy**: We wrap the model in a `FlashLLM` proxy that behaves exactly like the original (same mask protocol, same cache management), but intercepts the layer loop.
-3. **Synchronous Execution**: Instead of building a unified lazy graph for the whole model (which leads to OOM), we build and evaluate a graph for exactly **one layer**.
-4. **Immediate Eviction**: After each `mx.eval()`, we verify completion and clear the Metal cache. The weights for the current layer are immediately eligible for eviction from RAM by the OS.
+2. **Async Background Prefetch**: We extract exact byte offsets from `.safetensors` headers and use a background Python thread to explicitly `os.pread` pages directly into RAM. This bypasses the Python GIL and hides SSD latency from the GPU.
+3. **Pipelined Execution**: Instead of building a unified lazy graph for the whole model (which leads to OOM), we build and evaluate a graph for exactly **one layer**. CPU and GPU syncs are pipelined to maximize throughput.
+4. **Immediate Eviction**: After each `mx.eval()`, we verify completion, clear the Metal cache, and issue `madvise(MADV_FREE)`. The weights for the current layer are immediately flushed from unified RAM by macOS.
 5. **Efficiency Features**: Since `FlashLLM` is a drop-in proxy, you get all native `mlx-lm` features like **quantized KV cache** (`kv_bits`) and **sliding windows** (`max_kv_size`) for free.
 
 ---
@@ -87,7 +90,8 @@ graph TB
     subgraph CORE["mlx-flash"]
         FM["FlashManager"]
         FLLM["FlashLLM Wrapper\n(Duck-Typed Layer Interceptor)"]
-        PC["page_cache.py\nmadvise(WILLNEED/FREE)"]
+        BW["BackgroundPrefetcher\n(Thread drops GIL)"]
+        PC["page_cache.py\nmadvise(MADV_FREE)"]
     end
 
     subgraph METAL["Metal Runtime"]
@@ -100,10 +104,11 @@ graph TB
     GS --> FM
     FM --"lazy=True"--> LA
     GS --"forward"--> FLLM
-    FLLM --"prefetch"--> PC
+    FLLM --"enqueue chunk"--> BW
+    BW --"os.pread"--> LA
     FLLM --> EV
     EV --> CL_C
-```
+    CL_C --> PC
 
 ### 2 · Future Roadmap (MoE Expert Streaming)
 ```mermaid
@@ -129,7 +134,7 @@ flowchart LR
 
 ## Performance
 
-Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe.
+Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe. With **v0.2 Async I/O Prefetching** enabled, the OS pulls data from the SSD in the background, keeping the GPU constantly saturated.
 
 | Model | File Size | Flash Weight RAM | + KV Cache (2K ctx) | Total | Tok/s (M4 Air) |
 |-------|-----------|------------------|---------------------|-------|----------------|
@@ -143,9 +148,8 @@ Benchmarked on **M4 MacBook Air 16 GB** with internal NVMe.
 
 ---
 
-## Known Issues (v0.1.0)
-* **Async Prefetch (Roadmap)**: v0.1.0 performs purely synchronous I/O. Future versions (0.2+) will implement background prefetching using raw file mmap offsets to completely hide I/O latency.
-* **Disk KV Cache (Roadmap)**: Stable Disk KV offloading is deferred to v0.2.0 to ensure 100% data integrity and performance.
+## Known Issues (v0.1.1+)
+* **Disk KV Cache (Roadmap)**: Stable Disk KV offloading is deferred to v0.3.0 to ensure 100% data integrity and performance.
 * **Limited Context RAM**: While weights are streamed, the KV cache still grows in RAM. Use `max_kv_size` (sliding window) or `kv_bits` (quantization) to mitigate this.
 
 ---
@@ -196,15 +200,15 @@ The **☑ Enable Flash Weight Streaming** checkbox is a proposed feature for the
 Performance varies significantly depending on your SSD speed and unified memory bandwidth:
 * **M1/M2/M3 Air (Internal NVMe)**: Expect 4-8 tok/s on 30B models.
 * **M4 Pro/Max**: High memory bandwidth significantly improves layer transition speeds.
-* **External Drives**: Running models via Thunderbolt RAIDs is viable; standard USB-C Gen 2 (10Gbps) will be bottlenecked by I/O.
+* **External Drives**: Running models via Thunderbolt RAIDs is viable; standard USB-C Gen 2 (10Gbps) may be bottlenecked by I/O. **Note:** `mlx-flash` forces OS-level page cache populations via a background thread, mitigating SSD latency as much as physically possible.
 
 ---
 
 ## Roadmap
 Detailed milestones are available in [ROADMAP.md](ROADMAP.md).
-- **v0.1.x**: Stability, bug fixes, and PyPI release.
-- **v0.2.0**: Asynchronous prefetching and adaptive RAM budgeting.
+- **v0.2.x**: Stability, bug fixes, and PyPI release polish.
 - **v0.3.0**: Parallel Expert Streaming for MoE models (Mixtral/DeepSeek).
+- **v0.3.1**: Disk KV Cache offloading.
 
 ---
 
