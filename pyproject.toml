@@ -21,11 +21,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mlx>=0.20.0",
+    "mlx>=0.16.0",
     "mlx-lm>=0.20.0",
     "numpy>=1.26",
-    "safetensors>=0.4.3",
     "huggingface-hub>=0.23",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

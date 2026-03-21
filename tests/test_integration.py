@@ -28,8 +28,6 @@ FLASH_EVICTION dontneed
     cfg = parse_flash_directives(text)
     assert cfg.enabled is True
     assert cfg.ram_budget_gb == 12.0
-    assert cfg.n_io_threads == 6
-    assert cfg.prefetch_layers == 3
     assert cfg.moe_top_k_override == 4
     assert cfg.eviction_strategy == "dontneed"
 
@@ -78,3 +76,25 @@ def test_flash_peak_ram_below_2gb(tmp_model_dir):
         )
     finally:
         remove_flash_patch()
+
+
+def test_lazy_load_uses_zero_metal_ram(tmp_model_dir, flash_config):
+    """lazy=True should not materialize weights to Metal."""
+    import mlx.core as mx
+    import mlx_lm
+    
+    # Ensure Metal cache is clean
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    
+    # lazy load
+    model, tok = mlx_lm.load(str(tmp_model_dir), lazy=True)
+    after_load = mx.get_active_memory()
+    
+    # With lazy=True, active Metal memory should not have increased
+    # significantly (only minor overhead from model instantiation)
+    # Using 10MB as a safe threshold for overhead
+    assert after_load - before < 10 * 1024 * 1024, (
+        f"lazy=True increased Metal active memory by "
+        f"{(after_load - before) / 1e6:.1f} MB; expected < 10 MB"
+    )

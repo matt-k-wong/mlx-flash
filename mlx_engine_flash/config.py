@@ -62,6 +62,7 @@ class FlashConfig:
     prefill_chunk_size: int = 512              # tokens per prefill chunk; 0 = no chunking
     kv_cache_dir: Optional[str] = None         # If set, enable disk KV cache
     max_in_memory_kv_tokens: int = 2048        # evict to disk above this
+    moe_top_k_override: Optional[int] = None   # For MoE weight streaming
 
     # Derived / auto-detected — not set by user
     _n_cpu_cores: int = field(default_factory=lambda: os.cpu_count() or 4,
