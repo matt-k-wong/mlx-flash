@@ -28,7 +28,23 @@ class FlashLLM(nn.Module):
         
         # 2. Sequential Layers
         mask = kwargs.get("mask")
+        num_layers = len(backbone.layers)
+        
+        from .page_cache import prefetch_array
+        
         for i, layer in enumerate(backbone.layers):
+            # Prefetch the NEXT layer while THIS one is still logic (lazy)
+            if i + 1 < num_layers:
+                next_layer = backbone.layers[i + 1]
+                # Each parameter is an mx.array
+                for p in next_layer.parameters().values():
+                    if isinstance(p, mx.array):
+                        prefetch_array(p)
+                    elif isinstance(p, dict): # handle nested params (MoE)
+                        for sp in p.values():
+                            if isinstance(sp, mx.array):
+                                prefetch_array(sp)
+            
             l_cache = cache[i] if cache else None
             
             # Forward pass for one layer

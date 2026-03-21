@@ -49,16 +49,13 @@ class FlashConfig:
     """
 
     enabled: bool = False
-    ram_budget_gb: float = 6.0
-    n_io_threads: int = 4
-    prefetch_layers: int = 2
-    moe_top_k_override: int | None = None
+    ram_budget_gb: float = 2.0
+    debug: bool = False
     min_quant_bits: int = 4
     strict_quant: bool = False
     eviction_strategy: Literal["dontneed", "free", "none"] = "free"
     metal_kernels: bool = True
     expert_cache_size: int = 8  # Number of experts to keep in LRU cache
-    max_safe_context_tokens: int = 512
     strict_guardrails: bool = True   # Set False only for tiny models / testing
     debug: bool = False
 
