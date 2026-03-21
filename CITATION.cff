@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use mlx-flash in research, please cite:"
+title: "mlx-flash: Flash Weight Streaming for LLM Inference on Apple Silicon"
+authors:
+  - family-names: Wong
+    given-names: Matt K.
+repository-code: https://github.com/matt-k-wong/mlx-flash
+license: MIT
+date-released: 2024-05-20
+references:
+  - type: article
+    title: "LLM in a Flash: Efficient Large Language Model Inference with Limited Memory"
+    authors:
+      - family-names: Alizadeh
+        given-names: Keivan
+      - family-names: Kang
+        given-names: Iman
+      - family-names: Cherkasau
+        given-names: Seyed Mehrshad
+      - family-names: Simpson
+        given-names: Josh
+      - family-names: Gunst
+        given-names: Jeffrey
+      - family-names: Genovese
+        given-names: Mark
+      - family-names: Sapuntzakis
+        given-names: Constantine
+      - family-names: Szegedy
+        given-names: Christian
+      - family-names: Shali
+        given-names: Ashish
+    doi: 10.48550/arXiv.2312.11514
