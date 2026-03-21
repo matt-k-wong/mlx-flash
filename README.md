@@ -189,6 +189,22 @@ The **☑ Enable Flash Weight Streaming** checkbox is a proposed feature for the
 
 ---
 
+## Live Memory Monitor
+
+mlx-flash includes a real-time terminal dashboard to visualize Metal RAM usage and layer-by-layer progress.
+
+```bash
+# In terminal 1: run your model (e.g., Llama-3-70B)
+python examples/quick_start.py --model /path/to/model --flash
+
+# In terminal 2: watch memory and progress in real-time
+flash-monitor
+```
+
+![Live Monitor Demo](docs/assets/monitor_demo.gif)
+
+---
+
 ## Modelfile Usage
 
 Add to any `Modelfile` for Ollama-compatible frontends:

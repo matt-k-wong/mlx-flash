@@ -1,4 +1,5 @@
 import sys
+import time
 from typing import Any, Optional, Generator, List, Tuple, Dict
 from pathlib import Path
 
@@ -135,6 +136,19 @@ class FlashLLM(nn.Module):
             
             # Release Metal pool memory
             mx.clear_cache()
+            
+            # Telemetry
+            if self._config.monitor_queue is not None:
+                try:
+                    self._config.monitor_queue.put_nowait({
+                        "type": "layer_complete",
+                        "layer": i + 1,
+                        "n_layers": self._n_layers,
+                        "metal_active_mb": mx.get_active_memory() / 1e6,
+                        "timestamp": time.monotonic(),
+                    })
+                except Exception:
+                    pass
             
             if self._config.debug:
                 metal_mb = mx.get_active_memory() / 1e6

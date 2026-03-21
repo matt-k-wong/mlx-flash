@@ -47,6 +47,7 @@ Repository = "https://github.com/YOUR_USERNAME/mlx-flash"
 Issues = "https://github.com/YOUR_USERNAME/mlx-flash/issues"
 
 [project.scripts]
+flash-monitor = "mlx_engine_flash.monitor:run_monitor"
 flash-bench = "benchmarks.bench_flash:cli"
 
 [tool.ruff]

@@ -35,6 +35,10 @@ class FlashManager:
         # 1. Set Metal wired limit BEFORE loading weights
         self._apply_wired_limit()
         
+        # 1.5 Start Telemetry Bridge for flash-monitor
+        from .monitor import start_telemetry
+        self._telemetry_bridge = start_telemetry(self.config)
+        
         # 2. Native lazy load: weights are lazy mmap-backed MLX arrays.
         # Avoid recursion if mlx_lm is monkey-patched
         try:

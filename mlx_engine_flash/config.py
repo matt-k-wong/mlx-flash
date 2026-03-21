@@ -5,8 +5,9 @@ FlashConfig — all tuneable parameters for Flash Weight Streaming.
 from __future__ import annotations
 
 import os
+import queue
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional, Any
 
 
 @dataclass
@@ -63,6 +64,9 @@ class FlashConfig:
     kv_cache_dir: Optional[str] = None         # If set, enable disk KV cache
     max_in_memory_kv_tokens: int = 2048        # evict to disk above this
     moe_top_k_override: Optional[int] = None   # For MoE weight streaming
+    
+    # Telemetry
+    monitor_queue: Optional[queue.Queue] = None # If set, emit telemetry events
 
     # Derived / auto-detected — not set by user
     _n_cpu_cores: int = field(default_factory=lambda: os.cpu_count() or 4,
