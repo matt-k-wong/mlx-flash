@@ -63,6 +63,25 @@ class FlashManager:
         return self.model, self.tokenizer
 
     def shutdown(self):
-        pass
+        """
+        Release Metal resources and stop background telemetry.
+        """
+        import contextlib
+        if hasattr(self, "_telemetry_bridge") and self._telemetry_bridge:
+            with contextlib.suppress(Exception):
+                self._telemetry_bridge.stop()
+            self._telemetry_bridge = None
+
+        # 2. Restore Metal wired limit to 0 (default)
+        import contextlib
+        with contextlib.suppress(AttributeError, Exception):
+            mx.metal.set_wired_limit(0)
+
+        # 3. Clear model and tokenizer references to allow GC
+        self.model = None
+        self.tokenizer = None
+        
+        # 4. Clear Metal cache
+        mx.metal.clear_cache()
 
 __all__ = ["FlashManager"]

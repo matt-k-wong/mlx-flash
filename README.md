@@ -1,5 +1,6 @@
 # mlx-flash ⚡
 
+> **Flash Weight Streaming for MLX** — run 70 B, 120 B, and 397 B MoE
 > models on a 16 GB MacBook Air. **No additional quantisation — uses the model's native precision.**
 
 > **Project Lineage:** This implementation is inspired by Apple Research's paper [*LLM in a Flash* (arXiv 2312.11514)](https://arxiv.org/abs/2312.11514), which formalized the concept of using the OS page cache for efficient weight streaming. The original [`flash-moe`](https://github.com/danveloper/flash-moe) project provided the first Objective-C + Metal proof of concept for this approach on Apple Silicon. This repository (`mlx-flash`) extends those principles to the Python-based MLX ecosystem, providing a robust, duck-typed integration layer for `mlx-lm`.
@@ -201,7 +202,7 @@ python examples/quick_start.py --model /path/to/model --flash
 flash-monitor
 ```
 
-![Live Monitor Demo](docs/assets/monitor_demo.gif)
+![Live Monitor Demo](docs/assets/monitor_mockup.png)
 
 ---
 

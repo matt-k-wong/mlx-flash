@@ -22,14 +22,7 @@ class FlashConfig:
         normal mlx-lm load path is used unchanged.
     ram_budget_gb:
         Soft cap on resident weight RAM (in GB).  The OS page cache naturally
-        enforces this via LRU eviction; this value is used only to scale
-        prefetch aggressiveness.  Default 10 GB suits 16-GB Macs well.
-    n_io_threads:
-        Thread pool size for parallel pread().  4 saturates most NVMe drives;
-        raise to 6–8 for Thunderbolt RAID.
-    prefetch_layers:
-        How many transformer layers ahead to prefetch (madvise WILLNEED).
-        2 hides I/O latency on ~4 GB/s drives; raise to 4 on fast RAID.
+        enforces this via LRU eviction. Default 2.0 GB suits 8/16-GB Macs well.
     moe_top_k_override:
         If set, overrides the model's default top-K for MoE routing.  Useful
         to reduce RAM further (e.g. force K=1 for very low RAM at quality cost).

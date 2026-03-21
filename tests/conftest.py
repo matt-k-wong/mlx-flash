@@ -186,7 +186,6 @@ def flash_config():
     return FlashConfig(
         enabled=True,
         ram_budget_gb=1.0,   # Very tight budget to catch regressions
-        # moe_top_k_override=2, # Removed from FlashConfig in previous edit
         debug=False,          # Avoid print noise in tests
         max_kv_size=64,       # Small KV cache for tests
         prefill_chunk_size=32,

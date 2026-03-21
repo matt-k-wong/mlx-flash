@@ -6,6 +6,8 @@ from ..config import FlashConfig
 _ORIGINAL_LOAD = None
 _ORIGINAL_STREAM_GENERATE = None
 _ORIGINAL_GENERATE = None
+_ORIGINAL_SET_CACHE_LIMIT = None
+_ORIGINAL_SET_WIRED_LIMIT = None
 _LAST_LOOP = None
 
 def apply_flash_patch(config: FlashConfig | None = None) -> None:
@@ -13,6 +15,7 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
     Monkey-patch mlx_lm to be Flash-compatible.
     """
     global _ORIGINAL_LOAD, _ORIGINAL_STREAM_GENERATE, _ORIGINAL_GENERATE
+    global _ORIGINAL_SET_CACHE_LIMIT, _ORIGINAL_SET_WIRED_LIMIT
 
     if config is None:
         config = FlashConfig(enabled=False)
@@ -26,7 +29,9 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
     if _ORIGINAL_LOAD is not None:
         return
 
-    # LOCK DOWN METAL LIMITS
+    # LOCK DOWN METAL LIMITS (and save originals)
+    _ORIGINAL_SET_CACHE_LIMIT = mx.metal.set_cache_limit
+    _ORIGINAL_SET_WIRED_LIMIT = mx.metal.set_wired_limit
     mx.metal.set_cache_limit = lambda *args, **kwargs: None
     mx.metal.set_wired_limit = lambda *args, **kwargs: None
 
@@ -40,41 +45,24 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
             return _ORIGINAL_LOAD(path, *args, **kwargs)
         
         from ..manager import FlashManager
-        
-        # We use FlashManager to handle the lazy load and wrapping
         mgr = FlashManager(config)
         model, tokenizer = mgr.load(path)
+        # Store manager on model for later shutdown
+        model.manager = mgr
         return model, tokenizer
 
     mlx_lm.load = _flash_load
 
     # 2. Patch stream_generate
     def _flash_stream_generate(model, tokenizer, prompt, **kwargs):
-        from ..generation import FlashLLM
+        from ..generation import FlashGenerationLoop, FlashLLM
+        global _LAST_LOOP
+        
         if isinstance(model, FlashLLM):
-            # We can't use mlx_lm.stream_generate directly because it expects 
-            # the base model and builds a full graph.
-            # We must use our custom FlashGenerationLoop or a simplified version.
-            # Note: This is slightly suboptimal as it re-loads or wraps.
-            # In a real integration, we'd use the FlashLLM directly.
-            # For now, we manually iterate to keep it drop-in.
-            from mlx_lm.models.cache import KVCache
-            cache = [KVCache() for _ in range(len(model.model.layers))]
-            
-            import mlx.core as mx
-            tokens = mx.array(tokenizer.encode(prompt))
-            input_tokens = tokens[None]
-            max_tokens = kwargs.get("max_tokens", 100)
-            count = 0
-            while count < max_tokens:
-                logits = model(input_tokens, cache=cache, **kwargs)
-                next_token = mx.argmax(logits[:, -1, :], axis=-1)
-                token_id = next_token.tolist()[0]
-                yield token_id
-                input_tokens = next_token[None]
-                count += 1
-                if token_id == tokenizer.eos_token_id:
-                    break
+            # Use the production generation loop for proper decoding and sampling
+            loop = FlashGenerationLoop(model, tokenizer, config)
+            _LAST_LOOP = loop
+            yield from loop.stream_generate(prompt, **kwargs)
         else:
             yield from _ORIGINAL_STREAM_GENERATE(model, tokenizer, prompt, **kwargs)
 
@@ -85,10 +73,11 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
         def _flash_generate(model, tokenizer, prompt, **kwargs):
             from ..generation import FlashLLM
             if isinstance(model, FlashLLM):
-                tokens = []
-                for token in _flash_stream_generate(model, tokenizer, prompt, **kwargs):
-                    tokens.append(token)
-                return tokenizer.decode(tokens)
+                # stream_generate now returns text
+                full_text = ""
+                for chunk in _flash_stream_generate(model, tokenizer, prompt, **kwargs):
+                    full_text += chunk
+                return full_text
             else:
                 return _ORIGINAL_GENERATE(model, tokenizer, prompt, **kwargs)
         mlx_lm.generate = _flash_generate
@@ -96,22 +85,34 @@ def apply_flash_patch(config: FlashConfig | None = None) -> None:
 
 def remove_flash_patch() -> None:
     """Restore the original state."""
-    global _ORIGINAL_LOAD, _ORIGINAL_STREAM_GENERATE, _ORIGINAL_GENERATE, _LAST_LOOP
+    global _ORIGINAL_LOAD, _ORIGINAL_STREAM_GENERATE, _ORIGINAL_GENERATE
+    global _ORIGINAL_SET_CACHE_LIMIT, _ORIGINAL_SET_WIRED_LIMIT, _LAST_LOOP
+    
     if _ORIGINAL_LOAD is None:
         return
     
+    import mlx.core as mx
     import mlx_lm
+    
+    # Restore original functions
     mlx_lm.load = _ORIGINAL_LOAD
     mlx_lm.stream_generate = _ORIGINAL_STREAM_GENERATE
     if _ORIGINAL_GENERATE:
         mlx_lm.generate = _ORIGINAL_GENERATE
         
-    if _LAST_LOOP and hasattr(_LAST_LOOP, "manager"):
-        _LAST_LOOP.manager.shutdown()
+    if _ORIGINAL_SET_CACHE_LIMIT:
+        mx.metal.set_cache_limit = _ORIGINAL_SET_CACHE_LIMIT
+    if _ORIGINAL_SET_WIRED_LIMIT:
+        mx.metal.set_wired_limit = _ORIGINAL_SET_WIRED_LIMIT
+        
+    if _LAST_LOOP and hasattr(_LAST_LOOP, "model") and hasattr(_LAST_LOOP.model, "manager"):
+        _LAST_LOOP.model.manager.shutdown()
     
     _ORIGINAL_LOAD = None
     _ORIGINAL_STREAM_GENERATE = None
     _ORIGINAL_GENERATE = None
+    _ORIGINAL_SET_CACHE_LIMIT = None
+    _ORIGINAL_SET_WIRED_LIMIT = None
     _LAST_LOOP = None
 
 

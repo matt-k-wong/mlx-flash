@@ -173,25 +173,12 @@ class FlashLLM(nn.Module):
 
 def _prefetch_layer_params(layer: nn.Module) -> None:
     """Issue madvise(WILLNEED) on the mmap pages of a layer's parameters."""
-    import ctypes
-
-    from .page_cache import MADV_WILLNEED, get_libc
-    libc = get_libc()
-    if libc is None:
-        return
+    from .page_cache import prefetch_array
     for _, arr in tree_flatten(layer.parameters()):
-        if not isinstance(arr, mx.array):
-            continue
-        try:
-            # Access the memory pointer of the lazy array without evaluating it
-            info = arr.__array_interface__
-            if info is not None:
-                ptr, _ = info["data"]
-                libc.madvise(ctypes.c_void_p(ptr),
-                             ctypes.c_size_t(arr.nbytes),
-                             ctypes.c_int(MADV_WILLNEED))
-        except Exception:
-            pass
+        if isinstance(arr, mx.array):
+            # Note: Accessing the pointer for madvise currently triggers 
+            # implicit evaluation in MLX's buffer protocol.
+            prefetch_array(arr)
 
 class DiskKVCache:
     """KV cache that evicts old entries to mmap'd files on SSD."""
