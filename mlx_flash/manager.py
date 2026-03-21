@@ -16,6 +16,20 @@ class FlashManager:
         self.config = config or FlashConfig()
         self.model: Any = None
         self.tokenizer: Any = None
+        self._check_spotlight_warning()
+
+    def _check_spotlight_warning(self):
+        """Warn users if Spotlight indexing might degrade Flash performance."""
+        import os
+        flag_file = Path.home() / ".mlx_flash_spotlight_warned"
+        if not flag_file.exists():
+            print("\n[flash] ✨ Tip: If you experience lag or high SSD read latency, macOS Spotlight might be indexing your large model files.")
+            print("[flash]        Consider adding your models directory to Spotlight Privacy settings:")
+            print("[flash]        System Settings -> Siri & Spotlight -> Spotlight Privacy\n")
+            try:
+                flag_file.touch()
+            except Exception:
+                pass
 
     def _apply_wired_limit(self):
         """Set Metal wired memory limit based on RAM budget."""

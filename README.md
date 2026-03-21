@@ -159,12 +159,13 @@ Flash Mode uses the model's weights as-is with no additional quantisation. Outpu
 
 ## Quick Start
 
-### 1. Install from Source
+### 1. Install via pip
+
 ```bash
-git clone https://github.com/matt-k-wong/mlx-flash
-cd mlx-flash
-pip install -e .
+pip install mlx-flash
 ```
+
+*(Alternatively, to install from source: `git clone https://github.com/matt-k-wong/mlx-flash && cd mlx-flash && pip install -e .`)*
 
 ### 2. Using via Python
 ```python
