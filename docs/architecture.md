@@ -64,16 +64,25 @@ With 4 threads issuing simultaneous pread() calls against an NVMe device, we can
 achieve close to the device's sequential bandwidth even for discontiguous reads
 (typical for sparse expert patterns in MoE).
 
-## madvise() Strategy
-Layer N-2   Layer N-1   Layer N     Layer N+1   Layer N+2
-(evict)     (evict)     (COMPUTE)   (prefetch)  (prefetch)
+## Memory Strategy: Per-Layer Synchronous Evaluation
 
-* MADV_WILLNEED on layers N+1..N+prefetch_window → OS starts I/O immediately
-* MADV_FREE on layers N-2 → OS may reclaim pages under memory pressure
+`FlashLLM` processes one transformer layer at a time in a strict sequence:
 
-Net result: resident set stays at ~3-4 layers × layer_size
-For a 70B model (Q4_K_M, 40 GB total, ~2 layers/GB), this keeps ~8 GB resident
-while the remaining 32 GB sits on SSD.
+    for each layer i in [0, N):
+        h = layer_i(h, mask=mask, cache=cache[i])   ← builds ONE layer's graph
+        mx.eval(h, cache[i].keys, cache[i].values)  ← materialise immediately
+        mx.synchronize()                              ← wait for GPU to finish
+        mx.metal.clear_cache()                        ← return Metal buffers
+
+This means Metal holds at most **one layer's weights + activations** at any time.
+For a 70B model, a single Q4 layer is ~600 MB — so peak Metal active stays
+below 1 GB even though the full model is 40 GB on disk.
+
+The `page_cache.py` module provides `madvise()` wrappers (`MADV_WILLNEED`,
+`MADV_FREE`) that can be used to hint the OS about upcoming page needs,
+but the primary eviction mechanism is `mx.metal.clear_cache()` within the
+layer loop. Future versions (v0.2+) will integrate `madvise()` prefetch into
+the loop to hide SSD I/O latency behind GPU compute.
 
 ## Q4_0 Dequantisation
 Q4_0 block (18 bytes):
@@ -107,24 +116,23 @@ and GPU to run concurrently for consecutive experts.
 
 ## File Structure
 mlx_flash/
-├── __init__.py          — public API
-├── config.py            — FlashConfig dataclass
-├── page_cache.py        — madvise() wrappers (macOS)
-├── streamer.py          — SafetensorsIndex + WeightStreamer + ParallelPreader
-├── loader.py            — FlashModelLoader (layer-at-a-time)
-├── manager.py           — FlashManager (top-level, wraps mlx-lm)
-├── moe.py               — MoEConfig + MoERouter + MoEFlashHandler
-├── prefetch.py          — WeightPrefetcher daemon thread
-└── kernels/
-    ├── __init__.py      — kernel dispatch (Metal or fallback)
-    ├── flash_dequant.metal
-    ├── swiglu_fused.metal
-    ├── moe_dispatch.metal
-    └── compile_kernels.py
-
-integration/
-├── lmstudio.py          — apply_flash_patch() (monkey-patches mlx_lm.load)
-└── modelfile.py         — parse_flash_directives()
+├── __init__.py          — public API: FlashConfig, FlashManager, FlashLLM
+├── config.py            — FlashConfig dataclass with all tuning parameters
+├── generation.py        — FlashLLM wrapper + FlashGenerationLoop
+├── manager.py           — FlashManager: load(), shutdown(), telemetry
+├── monitor.py           — live curses RAM dashboard + TelemetryBridge
+├── diagnostics.py       — RAMProfiler for debug and testing
+├── page_cache.py        — madvise() wrappers (macOS prefetch/release hints)
+├── kernels/
+│   ├── __init__.py      — kernel dispatch (Metal or MLX fallback)
+│   ├── flash_dequant.metal  — Q4_0/Q4_1 dequant + fused GEMV kernels
+│   ├── swiglu_fused.metal   — fused SwiGLU activation kernel
+│   ├── moe_dispatch.metal   — MoE expert dispatch kernel
+│   └── compile_kernels.py   — AOT .metal → .metallib compiler
+└── integration/
+    ├── __init__.py
+    ├── lmstudio.py      — apply_flash_patch() / remove_flash_patch()
+    └── modelfile.py     — FLASH directive parser for Ollama-style Modelfiles
 
 ## Memory Budget Management: Weights vs. KV Cache vs. Activations
 

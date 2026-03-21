@@ -100,3 +100,50 @@ def test_lazy_load_uses_zero_metal_ram(tmp_model_dir, flash_config):
         f"lazy=True increased Metal active memory by "
         f"{(after_load - before) / 1e6:.1f} MB; expected < 10 MB"
     )
+
+
+def test_stream_generate_uses_flash_path(tmp_model_dir):
+    """Verify stream_generate routes through FlashLLM, not base model."""
+    import mlx_lm
+
+    from mlx_flash.config import FlashConfig
+    from mlx_flash.generation import FlashLLM
+    from mlx_flash.integration.lmstudio import apply_flash_patch, remove_flash_patch
+
+    remove_flash_patch()
+    apply_flash_patch(FlashConfig(enabled=True))
+
+    try:
+        model, tokenizer = mlx_lm.load(str(tmp_model_dir))
+
+        # Verify the model IS a FlashLLM
+        assert isinstance(model, FlashLLM), (
+            f"mlx_lm.load() returned {type(model).__name__}, not FlashLLM. "
+            f"The patch is not working."
+        )
+
+        # Verify __call__ is being intercepted (track calls)
+        call_count = [0]
+        original_call = FlashLLM.__call__
+
+        def tracking_call(self_obj, x, **kwargs):
+            call_count[0] += 1
+            return original_call(self_obj, x, **kwargs)
+
+        FlashLLM.__call__ = tracking_call
+
+        try:
+            tokens = list(mlx_lm.stream_generate(
+                model, tokenizer, "Hi", max_tokens=3
+            ))
+        finally:
+            FlashLLM.__call__ = original_call
+
+        assert call_count[0] > 0, (
+            "FlashLLM.__call__ was never invoked during stream_generate. "
+            "The generation loop is bypassing the Flash Mode wrapper."
+        )
+        assert len(tokens) > 0, "No tokens generated"
+
+    finally:
+        remove_flash_patch()

@@ -26,7 +26,7 @@ def load_model(model_path: str, config: dict) -> tuple:
         flash_cfg = FlashConfig(
             enabled=True,
             ram_budget_gb=config.get("flash_ram_gb", 10.0),
-            n_io_threads=config.get("flash_threads", 4),
+            debug=config.get("flash_debug", False),
         )
         apply_flash_patch(flash_cfg)
     return mlx_lm.load(model_path)
@@ -36,8 +36,9 @@ def load_model(model_path: str, config: dict) -> tuple:
 The LM Studio UI is Electron/React. The checkbox would add a flash_mode: true
 key to the inference config JSON passed to the mlx-engine subprocess.
 
-The config key name flash_mode matches what _should_use_flash() in lmstudio.py
-looks for in config.json.
+The config key name `flash_mode` is what the LM Studio UI would set in the
+inference config JSON. When `apply_flash_patch()` is called with `enabled=True`,
+all subsequent `mlx_lm.load()` calls return a `FlashLLM`-wrapped model.
 
 ## Testing without LM Studio
 ```bash

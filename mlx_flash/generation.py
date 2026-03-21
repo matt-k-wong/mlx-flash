@@ -157,7 +157,10 @@ class FlashLLM(nn.Module):
                     pass
             
             if self._config.debug:
-                metal_mb = mx.get_active_memory() / 1e6
+                try:
+                    metal_mb = mx.metal.get_active_memory() / 1e6
+                except AttributeError:
+                    metal_mb = mx.get_active_memory() / 1e6
                 print(f"[flash] layer {i:3d}/{self._n_layers}: "
                       f"Metal active {metal_mb:.0f} MB", file=sys.stderr)
         
@@ -204,41 +207,8 @@ class FlashGenerationLoop:
             self.flash_model = FlashLLM(self.model, config)
             
         n_layers = self.flash_model._n_layers
-        
-        # Initialize Cache
-        if config.max_kv_size is not None:
-            # mlx-lm >= 0.21 may require head_dim and n_heads for RotatingKVCache
-            # We try to detect if we need them, or just use the model's make_cache if possible.
-            from mlx_lm.models.cache import RotatingKVCache
-            
-            # Heuristic: try to get dimensions from the model, args, or config
-            sub = getattr(self.model, "model", self.model)
-            args = getattr(self.model, "args", getattr(self.model, "config", None))
-            
-            n_heads = (getattr(sub, "n_kv_heads", 0) or 
-                      getattr(sub, "num_key_value_heads", 0) or 
-                      (getattr(args, "n_kv_heads", 0) if args else 0) or
-                      (getattr(args, "num_key_value_heads", 0) if args else 0))
-            
-            head_dim = (getattr(sub, "head_dim", 0) or 
-                       (getattr(args, "head_dim", 0) if args else 0))
-            
-            try:
-                # Try new signature
-                self._cache = [
-                    RotatingKVCache(max_size=config.max_kv_size, keep=config.kv_keep, n_heads=n_heads, head_dim=head_dim)  # type: ignore
-                    for _ in range(n_layers)
-                ]
-            except TypeError:
-                # Fallback to old signature
-                self._cache = [
-                    RotatingKVCache(max_size=config.max_kv_size, keep=config.kv_keep)
-                    for _ in range(n_layers)
-                ]
-        else:
-            from mlx_lm.models.cache import make_prompt_cache
-            self._cache = make_prompt_cache(self.model)
-            
+        if self.config.debug:
+            print(f"[flash] FlashGenerationLoop ready: {n_layers} layers")
 
 
     def stream_generate(self, prompt: str, max_tokens: int = 100, **kwargs) -> Generator[str, None, None]:
@@ -265,11 +235,10 @@ class FlashGenerationLoop:
             yield result.text
 
     def shutdown(self):
-        """Clean up resources by shutting down the model manager."""
-        if hasattr(self.flash_model, "manager") and self.flash_model.manager:
-            self.flash_model.manager.shutdown()
-        # Also clear local references
-        self._cache = None
+        """Clean up resources."""
+        import contextlib
+        with contextlib.suppress(AttributeError, Exception):
+            mx.metal.clear_cache()
         self.flash_model = None
-        self.model: FlashLLM | None = None
-        self.tokenizer: Any = None
+        self.model = None
+        self.tokenizer = None

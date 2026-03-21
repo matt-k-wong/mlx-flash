@@ -82,8 +82,10 @@ def remove_flash_patch() -> None:
 
 
 def _should_use_flash(model_path: str, config: FlashConfig) -> bool:
+    """Check if Flash Mode should be used for this model."""
     if config.enabled:
         return True
+    # Check for Modelfile directives in the model directory
     p = pathlib.Path(model_path)
     for mf_name in ("Modelfile", "modelfile"):
         mf_path = p / mf_name
@@ -91,4 +93,4 @@ def _should_use_flash(model_path: str, config: FlashConfig) -> bool:
             from .modelfile import parse_flash_directives
             mf_config = parse_flash_directives(mf_path.read_text())
             return mf_config.enabled
-    return config.enabled
+    return False
