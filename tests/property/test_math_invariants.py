@@ -47,7 +47,11 @@ def test_streaming_determinism(tmp_model_dir, batch_size, seq_len, vocab_size):
     from mlx_flash.safetensors_mmap import SafetensorsMmapCache
     flash_engine.mmap_cache = SafetensorsMmapCache(tmp_model_dir)
     
-    actual_out = flash_engine(x)
+    # Create causal mask
+    L = x.shape[1]
+    mask = mx.triu(mx.full((L, L), -mx.inf), k=1).astype(mx.float16)
+    
+    actual_out = flash_engine(x, mask=mask)
     mx.eval(actual_out)
     
     # 4. Assert Bitwise Equality
