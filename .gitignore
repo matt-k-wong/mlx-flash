@@ -33,3 +33,4 @@ test_models/
 # Local Benchmarks and Scaling Tests
 test_flash_scaling.py
 docs/benchmarks_nemotron_cascade.md
+docs/INTERNAL_FINDINGS.md

@@ -99,7 +99,17 @@ class SafetensorsMmapCache:
     def prefetch_layer_background(self, layer_idx: int):
         ranges = self.get_layer_ranges(layer_idx)
         for _, (start, end, filename) in ranges.items():
-            self.prefetch_worker.enqueue(filename, start, end - start)
+            self.prefetch_worker.enqueue(filename, start, end - start, layer_idx)
+
+    def wait_for_layer(self, layer_idx: int):
+        self.prefetch_worker.wait_for_layer(layer_idx)
+
+    def record_compute_time(self, compute_time: float):
+        self.prefetch_worker.record_compute_time(compute_time)
+
+    @property
+    def k_distance(self):
+        return self.prefetch_worker.k_distance
 
     def shutdown(self):
         if hasattr(self, 'prefetch_worker'):

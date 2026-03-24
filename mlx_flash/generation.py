@@ -9,19 +9,14 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 import mlx_lm
-from mlx_lm.models.base import create_attention_mask
 
-from .config import FlashConfig
 from . import page_cache
+from .config import FlashConfig
 
 
 class FlashLLM(nn.Module):
     """
-    Wraps any mlx-lm Model to execute layers synchronously.
-    
-    Strategy: intercept execution at the layer level to iterate layers one
-    at a time with forced mx.eval() between each, rather than building
-    one unified lazy graph.
+    Wraps any mlx-lm Model to execute layers synchronously and stream weights.
     """
     
     def __init__(self, model: nn.Module, config: FlashConfig, model_path: str | Path | None = None):
@@ -29,7 +24,8 @@ class FlashLLM(nn.Module):
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_config", config)
         object.__setattr__(self, "_model_path", Path(model_path) if model_path else None)
-        # Identify the main sub-structure (Llama uses .model, Nemotron uses .backbone)
+        
+        # Identify structure (Llama uses .model, Nemotron uses .backbone)
         object.__setattr__(self, "_inner", (getattr(model, "model", None) or 
                                              getattr(model, "backbone", None) or 
                                              model))
@@ -46,51 +42,53 @@ class FlashLLM(nn.Module):
         object.__setattr__(self, "_pre_layer_fn", self._build_pre_layer_fn(model))
         object.__setattr__(self, "_post_layer_fn", self._build_post_layer_fn(model))
         object.__setattr__(self, "_layer_sigs", self._cache_layer_signatures())
-        object.__setattr__(self, "disk_cache", None)
         object.__setattr__(self, "mmap_cache", None)
         object.__setattr__(self, "_materialized_layers", [])
         
-        # Build per-layer weight file index for true weight streaming.
-        # This maps layer_idx -> [(safetensors_path, [tensor_keys_in_that_file])]
-        # so we can re-load just one layer's weights after mx.eval() orphans them.
-        weight_index = self._build_weight_index()
+        # Build weight index
+        weight_index, other_index = self._build_weight_index()
         object.__setattr__(self, "_layer_weight_index", weight_index)
+        object.__setattr__(self, "_other_weight_index", other_index)
         
-        # Pre-calculate unique safetensors files to avoid globbing in the hot path
+        # Track unique safetensors files
         all_files = set()
         for entries in weight_index:
             for sf_path, _ in entries:
                 all_files.add(sf_path)
+        for sf_path, _ in other_index:
+            all_files.add(sf_path)
         object.__setattr__(self, "_weight_files", sorted(list(all_files)))
-    
-    def _build_weight_index(self) -> list:
-        """Pre-compute per-layer weight file locations for true weight streaming.
-        
-        Returns a list where index i contains:
-            [(safetensors_path, [tensor_keys_belonging_to_layer_i]), ...]
-        """
+
+        # SESSION CACHE: Load all lazy handles once at startup.
+        # These are truly lazy (0 bytes Metal) and allow us to bypass
+        # mx.load() in the hot token loop.
+        handles = {}
+        for sf_path in self._weight_files:
+            handles.update(mx.load(sf_path))
+        object.__setattr__(self, "_weight_handles", handles)
+
+    @property
+    def layers(self):
+        return self._layers
+
+    def make_cache(self):
+        return self._model.make_cache()
+
+    def parameters(self):
+        return self._model.parameters()
+
+    def _build_weight_index(self) -> tuple[list, list]:
+        """Pre-compute per-layer weight locations."""
         if self._model_path is None:
-            return [[] for _ in range(self._n_layers)]
+            return [[] for _ in range(self._n_layers)], []
         
-        import glob
         import json
         import struct
+        import re
         
-        # Detect layer key prefix (Llama: "model.layers", Nemotron: "backbone.layers")
-        layer_attr_name = "layers"  # default
-        for attr in ("layers", "h", "blocks"):
-            if getattr(self._inner, attr, None) is self._layers:
-                layer_attr_name = attr
-                break
-        
-        # Detect parent prefix (e.g., "model." or "backbone.")
-        parent_prefix = ""
-        if hasattr(self._model, "model") and getattr(self._model, "model", None) is self._inner:
-            parent_prefix = "model."
-        elif hasattr(self._model, "backbone") and getattr(self._model, "backbone", None) is self._inner:
-            parent_prefix = "backbone."
-        
-        index = [[] for _ in range(self._n_layers)]
+        layer_regex = re.compile(r'\b(?:layers|h|blocks)\.(\d+)\.')
+        index: list[list[tuple[str, list[str]]]] = [[] for _ in range(self._n_layers)]
+        other_index_map: dict[str, list[str]] = {}
         
         sf_files = sorted(self._model_path.glob("*.safetensors"))
         for sf in sf_files:
@@ -99,259 +97,201 @@ class FlashLLM(nn.Module):
                     header_len = struct.unpack('<Q', f.read(8))[0]
                     header = json.loads(f.read(header_len).decode('utf-8'))
                 
-                # Group tensor keys by layer
                 layer_keys: dict[int, list] = {}
+                other_keys: list[str] = []
                 for key in header:
-                    if key == "__metadata__":
-                        continue
-                    prefix = f"{parent_prefix}{layer_attr_name}."
-                    if prefix in key:
-                        # Extract layer index from e.g. "backbone.layers.3.mixer.weight"
-                        after_prefix = key.split(prefix)[1]
-                        try:
-                            layer_idx = int(after_prefix.split(".")[0])
-                            if 0 <= layer_idx < self._n_layers:
-                                layer_keys.setdefault(layer_idx, []).append(key)
-                        except ValueError:
-                            pass
+                    if key == "__metadata__": continue
+                    m = layer_regex.search(key)
+                    if m:
+                        l_idx = int(m.group(1))
+                        if 0 <= l_idx < self._n_layers:
+                            layer_keys.setdefault(l_idx, []).append(key)
+                        else: other_keys.append(key)
+                    else: other_keys.append(key)
                 
-                for layer_idx, keys in layer_keys.items():
-                    index[layer_idx].append((str(sf), keys))
-                    
+                for l_idx, keys in layer_keys.items():
+                    index[l_idx].append((str(sf), keys))
+                if other_keys:
+                    other_index_map[str(sf)] = other_keys
             except Exception:
                 continue
         
-        return index
+        return index, [(path, keys) for path, keys in other_index_map.items()]
     
     def _reload_layer_weights(self, layer_idx: int):
-        """Re-load a layer's weights as fresh lazy arrays from disk.
-        
-        This orphans the old materialized Metal-resident arrays, allowing
-        Python's GC to release the Metal memory allocation.
-        """
+        """Re-load weights from the session handle cache."""
         entries = self._layer_weight_index[layer_idx]
-        if not entries:
-            return
+        if not entries: return
         
         layer = self._layers[layer_idx]
-        
-        # Detect the full prefix for this layer (e.g., "backbone.layers.3.")
-        layer_attr_name = "layers"
-        for attr in ("layers", "h", "blocks"):
-            if getattr(self._inner, attr, None) is self._layers:
-                layer_attr_name = attr
-                break
-        parent_prefix = ""
-        if hasattr(self._model, "model") and getattr(self._model, "model", None) is self._inner:
-            parent_prefix = "model."
-        elif hasattr(self._model, "backbone") and getattr(self._model, "backbone", None) is self._inner:
-            parent_prefix = "backbone."
         import re
         local_regex = re.compile(rf".*?\b(?:layers|h|blocks)\.{layer_idx}\.(.*)")
         
-        # Collect fresh lazy weights directly from disk
         fresh_weights = []
         for sf_path, keys in entries:
-            lazy_dict = mx.load(sf_path)
             for key in keys:
-                if key in lazy_dict:
-                    val = lazy_dict[key]
+                if key in self._weight_handles:
+                    # Create a fresh shared pointer to the underlying lazy data
+                    val = mx.array(self._weight_handles[key])
                     m = local_regex.match(key)
                     if m:
-                        local_name = m.group(1)
-                        fresh_weights.append((local_name, val))
+                        fresh_weights.append((m.group(1), val))
         
         if fresh_weights:
             layer.load_weights(fresh_weights, strict=False)
+
+    def _reload_other_weights(self):
+        """Re-load non-layer weights using session handles."""
+        if not hasattr(self, "_other_weight_index") or not self._other_weight_index:
+            return
+        fresh = []
+        for sf_path, keys in self._other_weight_index:
+            for k in keys:
+                if k in self._weight_handles:
+                    fresh.append((k, mx.array(self._weight_handles[k])))
+        if fresh:
+            self._model.load_weights(fresh, strict=False)
     
     def _build_pre_layer_fn(self, model):
-        """Return a function that runs everything BEFORE the layer stack."""
         sub = self._inner
-        embed = (getattr(sub, "embed_tokens", None) or
-                 getattr(sub, "embeddings", None) or
-                 getattr(sub, "wte", None) or
-                 getattr(sub, "word_embeddings", None) or
-                 getattr(sub, "token_embeddings", None))
-        if embed is None:
-            raise AttributeError("Cannot find embedding layer")
-        
-        def pre(x, mask=None):
-            h = embed(x)
-            return h
+        embed = (getattr(sub, "embed_tokens", None) or getattr(sub, "embeddings", None) or 
+                 getattr(sub, "wte", None) or getattr(sub, "word_embeddings", None))
+        def pre(x, mask=None): return embed(x)
         return pre
     
     def _build_post_layer_fn(self, model):
-        """Return a function that runs everything AFTER the layer stack."""
         sub = self._inner
-        norm = (getattr(sub, "norm", None) or
-                getattr(sub, "norm_f", None) or
-                getattr(sub, "ln_f", None) or
-                getattr(sub, "final_layer_norm", None))
-        lm_head = (getattr(model, "lm_head", None) or
-                   getattr(model, "head", None))
-        
+        norm = (getattr(sub, "norm", None) or getattr(sub, "norm_f", None) or 
+                getattr(sub, "ln_f", None) or getattr(sub, "final_layer_norm", None))
+        lm_head = getattr(model, "lm_head", None) or getattr(model, "head", None)
         def post(h):
-            if norm is not None:
-                h = norm(h)
-            if lm_head is not None:
-                h = lm_head(h)
+            if norm is not None: h = norm(h)
+            if lm_head is not None: h = lm_head(h)
             return h
         return post
     
     def _cache_layer_signatures(self) -> list[tuple[bool, bool, bool]]:
-        """Pre-compute (is_mamba, has_mask, has_cache) per layer."""
         sigs = []
         for layer in self._layers:
-            # Detect Mamba (Mamba2, SSM, mixer with ssm)
-            mixer = getattr(layer, "mixer", None)
-            is_mamba = (hasattr(layer, "ssm") or 
-                        (mixer is not None and (hasattr(mixer, "ssm") or "Mamba" in str(type(mixer)))))
-            
-            # Detect if this layer uses a cache entry
-            # In hybrid models (Nemotron-H), only Mamba (M) and Attention (*) blocks use cache.
-            # MLP and other blocks do not.
             params = inspect.signature(layer.__call__).parameters
-            has_cache_arg = "cache" in params
-            
-            # Heuristic for hybrid models: if a block has 'mixer', it's likely a container.
-            # If the block has a 'block_type' (Nemotron), use it.
             block_type = getattr(layer, "block_type", None)
             if block_type is not None:
                 has_cache = block_type in ("M", "*")
             else:
-                # Fallback to checking if it's an Attention or Mamba layer
-                has_cache = has_cache_arg and (
-                    is_mamba or 
-                    hasattr(layer, "attention") or 
-                    hasattr(layer, "self_attn") or
-                    (mixer is not None and ("Attention" in str(type(mixer)) or "Mixer" in str(type(mixer))))
+                mixer = getattr(layer, "mixer", None)
+                has_cache = "cache" in params and (
+                    hasattr(layer, "attention") or hasattr(layer, "self_attn") or
+                    (mixer is not None and ("Attention" in str(type(mixer))))
                 )
-                # If it's a standard transformer (Llama), it has no mixer but all layers use cache
-                if not has_cache and has_cache_arg and mixer is None:
-                    has_cache = True
-
-            sigs.append((is_mamba, "mask" in params, has_cache))
+            sigs.append((False, "mask" in params, has_cache))
         return sigs
     
     def __call__(self, *args, **kwargs) -> mx.array:
-        """Synchronous per-layer forward pass."""
+        """Leak-proof synchronous per-layer execution."""
+        # Clean environment
         import gc
         gc.collect()
         mx.clear_cache()
 
-        # Extract arguments robustly — mlx-lm models vary in (x, mask, cache) vs (x, cache, mask)
         x = args[0] if len(args) > 0 else kwargs.get("x")
-        
-        # Look for cache in kwargs or as the 2nd/3rd positional arg
         cache = kwargs.get("cache")
         if cache is None and len(args) > 1:
             for arg in args[1:]:
-                # Check for KVCache list or object
                 if isinstance(arg, list) or "KVCache" in str(type(arg)):
-                    cache = arg
-                    break
+                    cache = arg; break
         
-        # Look for mask in kwargs or as any non-cache positional arg
         mask = kwargs.get("mask")
         if mask is None and len(args) > 1:
             for arg in args[1:]:
-                if arg is not cache and not isinstance(arg, mx.array) and not isinstance(arg, str):
-                    continue # likely something else
-                if arg is not cache:
-                    mask = arg
-                    break
+                if arg is not cache and isinstance(arg, mx.array):
+                    mask = arg; break
                     
-        if x is None:
-            raise ValueError("FlashLLM.__call__ missing input 'x'")
+        if x is None: raise ValueError("Input x missing")
 
-        if self._config.debug:
-            print(f"[flash] __call__ input x: {x.shape} (tokens={x.size})", file=sys.stderr)
-
-        # Pre-layer: embedding
+        # Phase-Aware Depth
+        is_decode = x.shape[1] <= 1 if hasattr(x, "shape") else True
+        pipeline_depth = getattr(self._config, 'pipeline_depth', 4) if is_decode else 1
+        
         h = self._pre_layer_fn(x)
+        if isinstance(mask, str): mask = None
         
-        # 1. Fix the Mask Problem
-        # If mask is a string (e.g. "causal"), some hybrid models like Nemotron-H
-        # will crash trying to index it. Convert to None or a real mask.
-        if isinstance(mask, str):
-            mask = None
-            
-        # Pipelined synchronization tracker
         pending_releases = []
-        pipeline_depth = getattr(self._config, 'pipeline_depth', 2)
-        
-        # Prime the async prefetch pump
         if self.mmap_cache:
-            for p in range(pipeline_depth):
-                if p < self._n_layers:
-                    self.mmap_cache.prefetch_layer_background(p)
+            k = self.mmap_cache.k_distance if hasattr(self.mmap_cache, 'k_distance') else pipeline_depth
+            for p in range(k):
+                if p < self._n_layers: self.mmap_cache.prefetch_layer_background(p)
             
-        # Per-layer synchronous execution
         cache_ptr = 0
+        budget_bytes = self._config.ram_budget_gb * 1024**3
+
         for i in range(self._n_layers):
             layer = self._layers[i]
-            is_mamba, has_mask, has_cache = self._layer_sigs[i]
+            _, has_mask, has_cache = self._layer_sigs[i]
             
-            # Fetch cache entry if needed
             cache_entry = None
             if cache is not None and has_cache:
-                if cache_ptr < len(cache):
-                    cache_entry = cache[cache_ptr]
-                    cache_ptr += 1
+                # Handle subscriptable cache list or object
+                if hasattr(cache, "__getitem__"):
+                    try:
+                        if cache_ptr < len(cache):
+                            cache_entry = cache[cache_ptr]
+                            cache_ptr += 1
+                    except Exception:
+                        cache_entry = cache
                 else:
-                    # Fallback for misaligned caches
-                    cache_entry = None
+                    cache_entry = cache
             
-            # Enqueue the next layer outside of our current pipeline window
-            if self.mmap_cache and i + pipeline_depth < self._n_layers:
-                self.mmap_cache.prefetch_layer_background(i + pipeline_depth)
-                    
-            # Run this layer (builds a small graph for ONE layer)
-            # Use keyword arguments for robustness
-            call_kwargs = {}
-            if has_mask:
-                call_kwargs["mask"] = mask
-            if has_cache:
-                call_kwargs["cache"] = cache_entry
-            
-            output = layer(h, **call_kwargs)
-            
-            # Handle hybrid return types: some return (h, cache), some just h
-            if isinstance(output, (list, tuple)) and len(output) == 2:
-                h, cache_entry = output
-            else:
-                h = output
-            
-            # CRITICAL: materialise NOW before the next layer's graph is built
-            # We eval 'h' AND the cache state tensors to force the layer's 
-            # weights to be consumed and the cache to be updated.
-            import gc
-            gc.collect()
-            
-            if cache_entry is not None:
-                if hasattr(cache_entry, "state"):
-                    s = cache_entry.state
-                    if isinstance(s, (list, tuple)):
-                        mx.eval(h, *s)
-                    else:
-                        mx.eval(h, s)
-                elif hasattr(cache_entry, "keys") and hasattr(cache_entry, "values"):
-                    mx.eval(h, cache_entry.keys, cache_entry.values)
-                elif isinstance(cache_entry, (list, tuple)):
-                    mx.eval(h, *cache_entry)
-                else:
-                    mx.eval(h, cache_entry)
-            else:
-                mx.eval(h)
-            
-            # Queue this layer for release (OS Page Cache)
             if self.mmap_cache:
-                current_ranges = self.mmap_cache.get_layer_ranges(i)
-                pending_releases.append(current_ranges)
-            else:
-                pending_releases.append({})
+                k = self.mmap_cache.k_distance if hasattr(self.mmap_cache, 'k_distance') else pipeline_depth
+                for p in range(1, k + 1):
+                    if i + p < self._n_layers:
+                        self.mmap_cache.prefetch_layer_background(i + p)
+                if hasattr(self.mmap_cache, 'wait_for_layer'):
+                    self.mmap_cache.wait_for_layer(i)
+                    
+            call_kwargs = {}
+            if has_mask: call_kwargs["mask"] = mask
+            if has_cache: call_kwargs["cache"] = cache_entry
             
-            # If our pipeline queue is full, synchronize and release the oldest layer
+            t0_compute = time.perf_counter()
+            output = layer(h, **call_kwargs)
+            h = output[0] if (isinstance(output, (list, tuple)) and len(output) == 2) else output
+            
+            # Materialize
+            if cache_entry is not None:
+                if hasattr(cache_entry, "state") and cache_entry.state is not None:
+                    mx.eval(h, *[s for s in cache_entry.state if s is not None])
+                elif hasattr(cache_entry, "keys") and cache_entry.keys is not None:
+                    mx.eval(h, cache_entry.keys, cache_entry.values)
+                else: mx.eval(h)
+            else: mx.eval(h)
+            
+            mx.synchronize()
+            compute_time = time.perf_counter() - t0_compute
+            if self.mmap_cache and hasattr(self.mmap_cache, 'record_compute_time'):
+                self.mmap_cache.record_compute_time(compute_time)
+
+            # Eviction
+            if i not in self._materialized_layers:
+                self._materialized_layers.append(i)
+                
+            try: mem_active = mx.metal.get_active_memory()
+            except AttributeError: mem_active = mx.get_active_memory()
+
+            while self._materialized_layers and mem_active > budget_bytes:
+                oldest = self._materialized_layers.pop(0)
+                self._reload_layer_weights(oldest)
+                gc.collect()
+                mx.clear_cache()
+                try: 
+                    mx.synchronize()
+                    mem_active = mx.metal.get_active_memory()
+                except AttributeError: mem_active = mx.get_active_memory()
+            
+            if self.mmap_cache:
+                ranges = self.mmap_cache.get_layer_ranges(i)
+                if ranges: pending_releases.append(ranges)
+            
             if len(pending_releases) >= pipeline_depth:
                 mx.synchronize()
                 oldest_ranges = pending_releases.pop(0)
@@ -359,220 +299,69 @@ class FlashLLM(nn.Module):
                     if hasattr(page_cache, "release"):
                         page_cache.release(mm, start, end - start, strategy=self._config.eviction_strategy)
                     
-            # Release intermediate Metal memory (activations, etc.) regardless of streaming
             mx.clear_cache()
-            
-            # MEMORY vs SPEED TRADEOFF
-            # Only reload weights (streaming mode) if we are over our RAM budget.
-            # If we have spare RAM, we keep the weights materialized for speed.
-            try:
-                mem_active = mx.metal.get_active_memory()
-            except AttributeError:
-                mem_active = mx.get_active_memory()
-            
-            budget_bytes = self._config.ram_budget_gb * 1024**3
-            
-            # Track the materialized layer
-            if i not in self._materialized_layers:
-                self._materialized_layers.append(i)
-                
-            while self._materialized_layers and mem_active > budget_bytes:
-                # TRUE WEIGHT STREAMING: Re-load the oldest materialized layer's weights as fresh lazy
-                # arrays from disk. This orphans the old materialized Metal-resident arrays.
-                oldest_layer = self._materialized_layers.pop(0)
-                
-                if self._config.debug:
-                    l_obj = self._layers[oldest_layer]
-                    # Try to find a large weight to check refcount
-                    target = None
-                    if hasattr(l_obj, "mixer") and hasattr(l_obj.mixer, "switch_mlp"):
-                        target = getattr(l_obj.mixer.switch_mlp.fc1, "weight", None)
-                    elif hasattr(l_obj, "attention"):
-                        target = getattr(l_obj.attention.wq, "weight", None)
-                    
-                    if target is not None:
-                        print(f"[flash] Evicting layer {oldest_layer}. Refcount of weight: {sys.getrefcount(target)}", file=sys.stderr)
-
-                self._reload_layer_weights(oldest_layer)
-                
-                # FORCE Python to destroy orphaned mx.array objects so Metal can free them
-                import gc
-                gc.collect()
-                
-                mx.clear_cache()
-                
-                if self._config.debug:
-                    print(f"[flash] Budget exceeded ({mem_active/1e9:.1f}GB > {self._config.ram_budget_gb}GB). Evicting layer {oldest_layer}", file=sys.stderr)
-                    
-                # Re-check active memory
-                try:
-                    mx.synchronize()
-                    mem_active = mx.metal.get_active_memory()
-                except AttributeError:
-                    mx.synchronize()
-                    mem_active = mx.get_active_memory()
-            
-            # Telemetry
-            if self._config.monitor_queue is not None:
-                try:
-                    # Robust memory API check
-                    try:
-                        mem = mx.metal.get_active_memory()
-                    except AttributeError:
-                        mem = mx.get_active_memory()
-                    
-                    self._config.monitor_queue.put_nowait({
-                        "type": "layer_complete",
-                        "layer": i + 1,
-                        "n_layers": self._n_layers,
-                        "metal_active_mb": mem / 1e6,
-                        "timestamp": time.monotonic(),
-                    })
-                except Exception:
-                    pass
-            
             if self._config.debug:
-                try:
-                    metal_mb = mx.metal.get_active_memory() / 1e6
-                except AttributeError:
-                    metal_mb = mx.get_active_memory() / 1e6
-                print(f"[flash] layer {i:3d}/{self._n_layers}: "
-                      f"Metal active {metal_mb:.0f} MB", file=sys.stderr)
+                print(f"[flash] layer {i:2d}: Metal active {mem_active/1e6:.0f} MB", file=sys.stderr)
         
-        # Post-layer: norm + lm_head
         result = self._post_layer_fn(h)
         mx.eval(result)
         mx.synchronize()
-        if self._config.debug:
-            print(f"[flash] __call__ finished for tokens={x.size}", file=sys.stderr)
+        self._reload_other_weights()
+        mx.clear_cache()
+        gc.collect()
         return result
-    
+
     def parameters(self):
         return self._model.parameters()
-    
-    def update(self, params):
-        return self._model.update(params)
-
-    def __getattr__(self, name: str) -> Any:
-        # Don't delegate internal attributes (starting with _)
-        if name.startswith("_"):
-            raise AttributeError(name)
-        try:
-            model = object.__getattribute__(self, "_model")
-        except AttributeError:
-            raise AttributeError(name) from None
-        return getattr(model, name)
 
 class FlashGenerationLoop:
-    """
-    High-level generator that uses FlashLLM and mlx_lm.generate_step.
-    """
     def __init__(self, model_or_path: str | nn.Module, tokenizer: Any = None, config: FlashConfig = None):
-        if config is None:
-             from .config import FlashConfig
-             config = FlashConfig()
+        if config is None: config = FlashConfig()
         self.config = config
         
         if isinstance(model_or_path, (str, Path)):
-            self.model, self.tokenizer = mlx_lm.load(str(model_or_path), lazy=True)[:2]  # type: ignore
-            self.flash_model = FlashLLM(self.model, config)
-            # Initialize Mmap cache here
+            self.model, self.tokenizer = mlx_lm.load(str(model_or_path), lazy=True)[:2]
+            self.flash_model = FlashLLM(self.model, config, model_path=model_or_path)
             from .safetensors_mmap import SafetensorsMmapCache
             self.flash_model.mmap_cache = SafetensorsMmapCache(model_or_path)
-            
-        elif isinstance(model_or_path, FlashLLM):
-            self.flash_model = model_or_path
-            self.model = self.flash_model._model
-            self.tokenizer = tokenizer
-            if not hasattr(self.flash_model, 'mmap_cache'):
-                self.flash_model.mmap_cache = None
         else:
-            # Assume it is a base nn.Module from mlx_lm.load
             self.model = model_or_path
             self.tokenizer = tokenizer
             self.flash_model = FlashLLM(self.model, config)
-            self.flash_model.mmap_cache = None
             
-        n_layers = self.flash_model._n_layers
-        if self.config.debug:
-            print(f"[flash] FlashGenerationLoop ready: {n_layers} layers")
-
-
     def stream_generate(self, prompt: str, max_tokens: int = 100, **kwargs) -> Generator[str, None, None]:
-        """Generate tokens using the standard mlx_lm pipeline with FlashLLM.
-
-        Delegates to mlx_lm.stream_generate so behavior is identical to the
-        monkey-patch path.  FlashLLM is a transparent nn.Module proxy, so the
-        standard pipeline handles prefill, caching, and sampling correctly.
-        """
-        # Extract sampling params that generate_step doesn't accept directly.
-        # generate_step expects a `sampler` callable, not raw temp/top_p/top_k.
         from mlx_lm.sample_utils import make_sampler
-        sampler_args = {
-            "temp": kwargs.pop("temp", kwargs.pop("temperature", 0.0)),
-            "top_p": kwargs.pop("top_p", 1.0),
-            "top_k": kwargs.pop("top_k", 0),
-        }
-        kwargs["sampler"] = make_sampler(**sampler_args)
-
-        # Inject DiskKVCache if enabled
-        if getattr(self.config, "disk_kv_enabled", False):
-            if "prompt_cache" not in kwargs:
-                from mlx_flash.disk_kv_cache import DiskKVCache
-                import shutil
-                import tempfile
-                import uuid
-
-                kv_dir_cfg = getattr(self.config, "disk_kv_dir", "")
-                if kv_dir_cfg:
-                    kv_dir = Path(kv_dir_cfg)
-                else:
-                    kv_dir = Path(tempfile.gettempdir()) / f"mlx_flash_kv_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-
-                # Wipe old cache to ensure clean context
-                if kv_dir.exists():
-                    shutil.rmtree(kv_dir, ignore_errors=True)
-                kv_dir.mkdir(parents=True, exist_ok=True)
-
-                max_tokens = getattr(self.config, "disk_kv_max_tokens", None)
-
-                # Build the array of DiskKVCaches
-                prompt_cache = [DiskKVCache(layer_idx=i, cache_dir=str(kv_dir), max_tokens=max_tokens)
-                              for i in range(self.flash_model._n_layers)]
-                kwargs["prompt_cache"] = prompt_cache
-                self._disk_kv_caches = prompt_cache
-
-                if self.config.debug:
-                    print(f"[flash] Injected {len(prompt_cache)} DiskKVCache layers at {kv_dir}", file=sys.stderr)
-
-        # Enforce chunked prefill by default to solve the compilation reference leak.
-        # Compiled prefill (mlx-lm default) holds references to old weights,
-        # preventing them from being orphaned. Chunked prefill (step_size > 0)
-        # uses an iterative non-compiled path that respects orphaning.
+        from mlx_lm.generate import generate_step
+        
+        temp = kwargs.pop("temperature", kwargs.pop("temp", 0.0))
+        kwargs["sampler"] = make_sampler(temp=temp)
         if "prefill_step_size" not in kwargs:
-            kwargs["prefill_step_size"] = 1
+            kwargs["prefill_step_size"] = getattr(self.config, "prefill_chunk_size", 32)
 
-        # CRITICAL: clear any dangling references from mlx_lm.load()
         import gc
         gc.collect()
         mx.clear_cache()
 
-        for result in mlx_lm.stream_generate(
-            self.flash_model, self.tokenizer, prompt,
-            max_tokens=max_tokens, **kwargs,
-        ):
-            yield result.text
+        prompt_arr = mx.array(self.tokenizer.encode(prompt)) if isinstance(prompt, str) else mx.array(prompt)
+        detokenizer = self.tokenizer.detokenizer
+        detokenizer.reset()
+
+        for token, _ in generate_step(prompt_arr, self.flash_model, **kwargs):
+            tid = token.item() if hasattr(token, "item") else token
+            detokenizer.add_token(tid)
+            if detokenizer.last_segment: yield detokenizer.last_segment
+            gc.collect()
+            mx.clear_cache()
+            if tid == self.tokenizer.eos_token_id: break
+        
+        detokenizer.finalize()
+        if detokenizer.last_segment: yield detokenizer.last_segment
 
     def shutdown(self):
-        """Clean up resources."""
         import contextlib
-        # Close DiskKVCache layers if they exist
-        for cache in getattr(self, "_disk_kv_caches", []):
-            with contextlib.suppress(Exception):
-                cache.close()
-        self._disk_kv_caches = []
-        with contextlib.suppress(AttributeError, Exception):
-            mx.metal.clear_cache()
+        mx.clear_cache()
+        if self.flash_model is not None and getattr(self.flash_model, "mmap_cache", None) is not None:
+            with contextlib.suppress(Exception): self.flash_model.mmap_cache.shutdown()
         self.flash_model = None
         self.model = None
         self.tokenizer = None

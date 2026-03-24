@@ -1,0 +1,16 @@
+    def shutdown(self):
+        """Clean up resources."""
+        import contextlib
+        # Close DiskKVCache layers if they exist
+        for cache in getattr(self, "_disk_kv_caches", []):
+            with contextlib.suppress(Exception):
+                cache.close()
+        self._disk_kv_caches = []
+        with contextlib.suppress(AttributeError, Exception):
+            mx.metal.clear_cache()
+        if self.flash_model is not None and getattr(self.flash_model, "mmap_cache", None) is not None:
+            with contextlib.suppress(Exception):
+                self.flash_model.mmap_cache.shutdown()
+        self.flash_model = None
+        self.model = None
+        self.tokenizer = None
