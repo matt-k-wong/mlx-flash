@@ -74,6 +74,9 @@ class FlashConfig:
     tiled_execution: bool = False
     tile_size: int = 1024
     
+    # Sub-component Graph Pipelining 
+    pipelined_execution: bool = False
+    
     # Telemetry
     monitor_queue: queue.Queue | None = None # If set, emit telemetry events
 

@@ -224,6 +224,12 @@ class FlashLLM(nn.Module):
         cache_ptr = 0
         budget_bytes = self._config.ram_budget_gb * 1024**3
 
+        # Initialize PipelinedExecutor if pipelining is enabled
+        pipelined_executor = None
+        if getattr(self._config, 'pipelined_execution', False):
+            from .pipeline.executor import PipelinedExecutor
+            pipelined_executor = PipelinedExecutor(self.mmap_cache)
+
         for i in range(self._n_layers):
             layer = self._layers[i]
             _, has_mask, has_cache = self._layer_sigs[i]
@@ -241,35 +247,44 @@ class FlashLLM(nn.Module):
                 else:
                     cache_entry = cache
             
-            if self.mmap_cache:
-                k = self.mmap_cache.k_distance if hasattr(self.mmap_cache, 'k_distance') else pipeline_depth
-                for p in range(1, k + 1):
-                    if i + p < self._n_layers:
-                        self.mmap_cache.prefetch_layer_background(i + p)
-                if hasattr(self.mmap_cache, 'wait_for_layer'):
-                    self.mmap_cache.wait_for_layer(i)
-                    
-            call_kwargs = {}
-            if has_mask: call_kwargs["mask"] = mask
-            if has_cache: call_kwargs["cache"] = cache_entry
-            
-            t0_compute = time.perf_counter()
-            output = layer(h, **call_kwargs)
-            h = output[0] if (isinstance(output, (list, tuple)) and len(output) == 2) else output
-            
-            # Materialize
-            if cache_entry is not None:
-                if hasattr(cache_entry, "state") and cache_entry.state is not None:
-                    mx.eval(h, *[s for s in cache_entry.state if s is not None])
-                elif hasattr(cache_entry, "keys") and cache_entry.keys is not None:
-                    mx.eval(h, cache_entry.keys, cache_entry.values)
+            if pipelined_executor is not None:
+                t0_compute = time.perf_counter()
+                h = pipelined_executor.execute_dense_layer(
+                    h, layer, i, mask=mask if has_mask else None, cache=cache_entry if has_cache else None
+                )
+                compute_time = time.perf_counter() - t0_compute
+                if self.mmap_cache and hasattr(self.mmap_cache, 'record_compute_time'):
+                    self.mmap_cache.record_compute_time(compute_time)
+            else:
+                if self.mmap_cache:
+                    k = self.mmap_cache.k_distance if hasattr(self.mmap_cache, 'k_distance') else pipeline_depth
+                    for p in range(1, k + 1):
+                        if i + p < self._n_layers:
+                            self.mmap_cache.prefetch_layer_background(i + p)
+                    if hasattr(self.mmap_cache, 'wait_for_layer'):
+                        self.mmap_cache.wait_for_layer(i)
+                        
+                call_kwargs = {}
+                if has_mask: call_kwargs["mask"] = mask
+                if has_cache: call_kwargs["cache"] = cache_entry
+                
+                t0_compute = time.perf_counter()
+                output = layer(h, **call_kwargs)
+                h = output[0] if (isinstance(output, (list, tuple)) and len(output) == 2) else output
+                
+                # Materialize
+                if cache_entry is not None:
+                    if hasattr(cache_entry, "state") and cache_entry.state is not None:
+                        mx.eval(h, *[s for s in cache_entry.state if s is not None])
+                    elif hasattr(cache_entry, "keys") and cache_entry.keys is not None:
+                        mx.eval(h, cache_entry.keys, cache_entry.values)
+                    else: mx.eval(h)
                 else: mx.eval(h)
-            else: mx.eval(h)
-            
-            mx.synchronize()
-            compute_time = time.perf_counter() - t0_compute
-            if self.mmap_cache and hasattr(self.mmap_cache, 'record_compute_time'):
-                self.mmap_cache.record_compute_time(compute_time)
+                
+                mx.synchronize()
+                compute_time = time.perf_counter() - t0_compute
+                if self.mmap_cache and hasattr(self.mmap_cache, 'record_compute_time'):
+                    self.mmap_cache.record_compute_time(compute_time)
 
             # Eviction
             if i not in self._materialized_layers:
