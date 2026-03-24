@@ -70,9 +70,10 @@ class FlashConfig:
     disk_kv_dir: str = ""                    # Empty = auto-generate unique path
     disk_kv_max_tokens: int | None = None    # None = unlimited; set to bound disk usage
     
-    # Quantized KV Cache (Reduces KV RAM footprint by 4x)
+    # Quantized KV Cache (Reduces KV RAM footprint by 4x if 4-bit, 2x if 8-bit)
     kv_cache_quantized: bool = False
-    kv_cache_bits: int = 4
+    kv_cache_bits: int = 8
+    kv_cache_local_window_size: int = 128
     
     # Blockwise Tiled Execution
     tiled_execution: bool = False
