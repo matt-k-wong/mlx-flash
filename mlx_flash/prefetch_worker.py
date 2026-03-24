@@ -25,6 +25,7 @@ class BackgroundPrefetcher:
         
         self.queue: queue.Queue[tuple[Optional[int], str, int, int]] = queue.Queue(maxsize=16) 
         self.completed_prefetches = set()
+        self._lock = threading.Lock()
         
         self.running = True
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -42,6 +43,13 @@ class BackgroundPrefetcher:
                     
                 layer_idx, filename, offset, length, align_bytes = task
                 f = self.file_handles.get(filename)
+                if f is None:
+                    # Try to open it if missing
+                    try:
+                        f = open(filename, "rb")
+                        self.file_handles[filename] = f
+                    except Exception:
+                        pass
                 
                 t0 = time.perf_counter()
                 
@@ -73,8 +81,10 @@ class BackgroundPrefetcher:
                             
                             try:
                                 from benchmarks.profiler.profiler import StreamingProfiler
-                                StreamingProfiler().record_pread(duration, chunk_size)
-                            except ImportError:
+                                prof = StreamingProfiler()
+                                prof.record_pread(duration, chunk_size)
+                                prof.record_io_interval(t_read_0, t_read_1, chunk_size)
+                            except Exception:
                                 pass
                                 
                             curr += chunk_size
@@ -84,7 +94,8 @@ class BackgroundPrefetcher:
                 io_time = time.perf_counter() - t0
                 if layer_idx is not None:
                     self._update_io_ema(io_time)
-                    self.completed_prefetches.add(layer_idx)
+                    with self._lock:
+                        self.completed_prefetches.add(layer_idx)
                     
                 self.queue.task_done()
             except queue.Empty:
@@ -107,14 +118,20 @@ class BackgroundPrefetcher:
 
     def wait_for_layer(self, layer_idx: int):
         """Stall if the layer isn't fully in page cache to prevent hard page fault."""
-        while layer_idx not in self.completed_prefetches and self.io_ema > 0 and self.running:
+        while self.running:
+            with self._lock:
+                if layer_idx in self.completed_prefetches:
+                    break
+            if self.io_ema <= 0:
+                break
             time.sleep(0.001)
 
     def enqueue(self, filename: str, offset: int, length: int, layer_idx: Optional[int] = None, align_bytes: int = 1):
         if not self.running:
             return
         if layer_idx is not None:
-            self.completed_prefetches.discard(layer_idx)
+            with self._lock:
+                self.completed_prefetches.discard(layer_idx)
         with contextlib.suppress(queue.Full):
             self.queue.put_nowait((layer_idx, filename, offset, length, align_bytes))
 

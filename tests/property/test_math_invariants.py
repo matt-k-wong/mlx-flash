@@ -39,9 +39,14 @@ def test_streaming_determinism(tmp_model_dir, batch_size, seq_len, vocab_size):
         enabled=True, 
         tiled_execution=True, 
         tile_size=128, 
-        pipelined_execution=True
+        pipelined_execution=True,
+        debug=True
     )
     flash_engine = FlashEngine(model_lazy, tokenizer, config)
+    
+    from mlx_flash.safetensors_mmap import SafetensorsMmapCache
+    flash_engine.mmap_cache = SafetensorsMmapCache(tmp_model_dir)
+    
     actual_out = flash_engine(x)
     mx.eval(actual_out)
     

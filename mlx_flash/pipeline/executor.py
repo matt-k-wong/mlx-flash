@@ -1,5 +1,6 @@
 import mlx.core as mx
 import mlx.nn as nn
+import time
 
 class PipelinedExecutor:
     """
@@ -18,9 +19,7 @@ class PipelinedExecutor:
             return
             
         ranges = self.mmap_cache.get_layer_ranges(layer_idx)
-        # In a fully realized system, we would filter `ranges` by tensor_name_hint
-        # For now, we use the existing layer-level prefetch as a coarse fallback
-        # if fine-grained isn't implemented in the cache yet.
+        
         for _, (start, end, filename, dtype) in ranges.items():
             align_bytes = 1
             if dtype == "q4_0": align_bytes = 18
@@ -33,18 +32,20 @@ class PipelinedExecutor:
             self.mmap_cache.wait_for_layer(layer_idx)
 
     def execute_moe_layer(self, x: mx.array, layer: nn.Module, layer_idx: int, moe_prefetcher, mask=None, cache=None) -> mx.array:
-        """
-        Executes a Mixture of Experts layer, heavily overlapping the router computation 
-        with speculative and deterministic expert prefetching.
-        """
+        from benchmarks.profiler.profiler import StreamingProfiler
+        prof = StreamingProfiler()
+        
         # ==========================================
         # PHASE 1: PRE-ATTENTION PIPELINE
         # ==========================================
         self._enqueue_tensor(layer_idx, "attention")
         
+        t_p1_0 = time.perf_counter()
         if hasattr(layer, "input_layernorm"): h = layer.input_layernorm(x)
         elif hasattr(layer, "norm"): h = layer.norm(x)
         else: h = x
+        mx.synchronize()
+        prof.record_compute_interval(t_p1_0, time.perf_counter(), f"L{layer_idx}_p1_norm")
             
         # ==========================================
         # PHASE 2: ATTENTION OVERLAP
@@ -54,6 +55,7 @@ class PipelinedExecutor:
         # IO: Instead of fetching the whole MLP, just fetch the tiny Router
         self._enqueue_tensor(layer_idx, "router")
         
+        t_p2_0 = time.perf_counter()
         attn_module = getattr(layer, "self_attn", getattr(layer, "attention", None))
         if attn_module is not None:
             call_kwargs = {}
@@ -64,11 +66,14 @@ class PipelinedExecutor:
             attn_out = attn_out[0] if isinstance(attn_out, (list, tuple)) else attn_out
             x = x + attn_out
             mx.eval(x)
+            mx.synchronize()
+            prof.record_compute_interval(t_p2_0, time.perf_counter(), f"L{layer_idx}_p2_attn")
             mx.metal.clear_cache()
             
         # ==========================================
         # PHASE 3: MoE ROUTING & SPECULATIVE FETCH
         # ==========================================
+        t_p3_0 = time.perf_counter()
         if hasattr(layer, "post_attention_layernorm"): h = layer.post_attention_layernorm(x)
         elif hasattr(layer, "norm_f"): h = layer.norm_f(x)
         else: h = x
@@ -90,6 +95,8 @@ class PipelinedExecutor:
                 logits = router(h)
                 
             mx.eval(logits)
+            mx.synchronize()
+            prof.record_compute_interval(t_p3_0, time.perf_counter(), f"L{layer_idx}_p3_router")
             
             top_k = getattr(mlp_module, "num_experts_per_tok", getattr(mlp_module.config, "num_experts_per_tok", 2))
             
@@ -115,8 +122,13 @@ class PipelinedExecutor:
                          self._enqueue_tensor(layer_idx, f"experts.{exp_idx}")
                          
                 self._wait_for_layer(layer_idx) 
+                
+                t_exp_0 = time.perf_counter()
                 mlp_out = mlp_module(h)
                 x = x + mlp_out
+                mx.eval(x)
+                mx.synchronize()
+                prof.record_compute_interval(t_exp_0, time.perf_counter(), f"L{layer_idx}_p3_experts_decode")
                 
             else:
                 # ========================================================
@@ -125,29 +137,23 @@ class PipelinedExecutor:
                 # Compute routing softmax
                 scores = mx.softmax(logits, axis=-1)
                 
-                # Get top-k indices and values using MLX built-ins
-                # MLX topk is available in newer versions, assuming it exists or fallback
-                # For safety across MLX versions, we'll use a sort if topk is missing
+                # Get top-k indices and values
                 if hasattr(mx, "topk"):
                     top_scores, top_indices = mx.topk(scores, k=top_k, axis=-1)
                 else:
-                    sorted_indices = mx.argsort(scores, axis=-1)
-                    top_indices = sorted_indices[..., -top_k:]
-                    # Reverse to get descending order
-                    top_indices = top_indices[..., ::-1]
-                    # Gather scores
+                    top_indices = mx.argsort(scores, axis=-1)[..., -top_k:][..., ::-1]
                     top_scores = mx.take_along_axis(scores, top_indices, axis=-1)
                 
-                # Flatten everything to 1D
+                # Normalize scores correctly across the top-k experts
+                denom = mx.sum(top_scores, axis=-1, keepdims=True)
+                top_scores = top_scores / denom
+                
+                # Flatten for expert dispatch
                 flat_indices = mx.reshape(top_indices, (-1,))
                 flat_scores = mx.reshape(top_scores, (-1,))
                 
-                # Normalize scores if required by architecture
-                flat_scores = flat_scores / mx.sum(top_scores, axis=-1, keepdims=True).reshape(-1,)
-                
                 final_mlp_out = mx.zeros_like(h)
                 
-                # Find unique experts required for this batch
                 import numpy as np
                 unique_experts = np.unique(np.array(flat_indices)).tolist()
                 
@@ -158,46 +164,41 @@ class PipelinedExecutor:
                         
                 # Execute expert by expert
                 for exp_idx in unique_experts:
-                    self._wait_for_layer(layer_idx) # Wait for this specific expert's IO
+                    self._wait_for_layer(layer_idx)
                     
+                    t_expert_s = time.perf_counter()
                     # 1. Find which tokens requested this expert
                     token_mask = (flat_indices == exp_idx)
+                    full_indices = mx.arange(flat_indices.shape[0])
+                    active_indices = full_indices[token_mask]
+                    token_ids = active_indices // top_k
                     
-                    if not mx.any(token_mask).item():
+                    if token_ids.shape[0] == 0:
                         continue
                         
-                    # 2. Extract weights
                     expert_weights = flat_scores[token_mask]
-                    
-                    # 3. Map flattened index back to original sequence token ID
-                    token_ids = mx.arange(seq_len * top_k)[token_mask] // top_k
-                    
-                    # Ensure dimensions match for extraction
-                    # h is [batch, seq, dim], assume batch=1 for standard prefill
                     expert_input = h[0, token_ids, :]
                     
-                    # 4. Compute Expert (only for active tokens)
-                    expert_module = getattr(mlp_module, "experts")[exp_idx]
+                    expert_module = mlp_module.experts[exp_idx]
                     expert_out = expert_module(expert_input)
-                    
                     expert_out = expert_out * mx.expand_dims(expert_weights, axis=-1)
                     
-                    # 5. Scatter Add results
-                    # MLX scatter requires updates to match indices
                     final_mlp_out[0] = mx.scatter_add(final_mlp_out[0], token_ids, expert_out)
-                    
                     mx.eval(final_mlp_out)
-                    
-                    # Yield VRAM immediately
-                    # In a real system we'd explicitly clear this expert if we are over budget
+                    mx.synchronize()
+                    prof.record_compute_interval(t_expert_s, time.perf_counter(), f"L{layer_idx}_exp{exp_idx}")
                     mx.metal.clear_cache()
                     
                 x = x + final_mlp_out
             
         mx.eval(x)
+        mx.synchronize()
         mx.metal.clear_cache()
         return x
     def execute_dense_layer(self, x: mx.array, layer: nn.Module, layer_idx: int, mask=None, cache=None) -> mx.array:
+        from benchmarks.profiler.profiler import StreamingProfiler
+        prof = StreamingProfiler()
+        
         # ==========================================
         # PHASE 1: PRE-ATTENTION PIPELINE
         # ==========================================
@@ -205,12 +206,15 @@ class PipelinedExecutor:
         self._enqueue_tensor(layer_idx, "attention")
         
         # GPU: Input Norm (fast, requires no SSD weights)
+        t_p1_0 = time.perf_counter()
         if hasattr(layer, "input_layernorm"):
             h = layer.input_layernorm(x)
         elif hasattr(layer, "norm"):
             h = layer.norm(x)
         else:
             h = x
+        mx.synchronize()
+        prof.record_compute_interval(t_p1_0, time.perf_counter(), f"L{layer_idx}_p1_norm")
             
         # ==========================================
         # PHASE 2: ATTENTION OVERLAP
@@ -222,7 +226,7 @@ class PipelinedExecutor:
         self._enqueue_tensor(layer_idx, "mlp")
         
         # GPU: Attention computation
-        # (Assuming the layer has a standard self_attn or attention attribute)
+        t_p2_0 = time.perf_counter()
         attn_module = getattr(layer, "self_attn", getattr(layer, "attention", None))
         
         if attn_module is not None:
@@ -231,7 +235,6 @@ class PipelinedExecutor:
             if cache is not None: call_kwargs["cache"] = cache
             
             attn_out = attn_module(h, **call_kwargs)
-            # Handle tuple returns (some attention modules return cache states)
             attn_out = attn_out[0] if isinstance(attn_out, (list, tuple)) else attn_out
             
             x = x + attn_out
@@ -243,12 +246,15 @@ class PipelinedExecutor:
                      mx.eval(*[s for s in cache.state if s is not None])
                  elif hasattr(cache, "keys") and cache.keys is not None:
                      mx.eval(cache.keys, cache.values)
+            mx.synchronize()
+            prof.record_compute_interval(t_p2_0, time.perf_counter(), f"L{layer_idx}_p2_attn")
             mx.metal.clear_cache()
             
         # ==========================================
         # PHASE 3: MLP EXECUTION
         # ==========================================
         # GPU: Post-attention norm
+        t_p3_0 = time.perf_counter()
         if hasattr(layer, "post_attention_layernorm"):
             h = layer.post_attention_layernorm(x)
         elif hasattr(layer, "norm_f"): # Specific to some architectures
@@ -267,6 +273,8 @@ class PipelinedExecutor:
             
         # Final layer sync
         mx.eval(x)
+        mx.synchronize()
+        prof.record_compute_interval(t_p3_0, time.perf_counter(), f"L{layer_idx}_p3_mlp")
         mx.metal.clear_cache()
         
         return x

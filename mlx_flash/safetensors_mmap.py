@@ -28,7 +28,8 @@ class SafetensorsMmapCache:
             return
 
         for sf in safetensor_files:
-            with contextlib.suppress(Exception), open(sf, "rb") as f:
+            try:
+                f = open(sf, "rb")
                 self.file_handles[sf.name] = f
                 
                 # Safetensors header format: 8-byte little-endian uint64 length of JSON header
@@ -44,7 +45,6 @@ class SafetensorsMmapCache:
                 headers_end = 8 + header_len
                 
                 # Create mmap for the entire file
-                # mmap(fileno, length, flags, prot, access, offset)
                 mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
                 self.file_mmaps[sf.name] = mm
                 
@@ -58,7 +58,8 @@ class SafetensorsMmapCache:
                         abs_start = headers_end + offsets[0]
                         abs_end = headers_end + offsets[1]
                         self.tensor_locations[tensor_name] = (mm, abs_start, abs_end, sf.name, dtype)
-                        
+            except Exception:
+                pass
 
     def get_tensor_range(self, tensor_name: str) -> tuple[mmap.mmap, int, int, str] | None:
         """Return the (mmap_obj, absolute_start, absolute_end, dtype) for a given tensor."""

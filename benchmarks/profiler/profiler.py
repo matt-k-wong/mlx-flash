@@ -7,7 +7,7 @@ from typing import Dict, List, Any
 class StreamingProfiler:
     """
     Passively collects timing metrics for IO and GPU compute across layers,
-    and analyzes the data to identify bottlenecks.
+    and analyzes the data to identify true concurrent overlap.
     """
     
     _instance = None
@@ -24,10 +24,81 @@ class StreamingProfiler:
         self.token_times = []
         self.start_time = time.perf_counter()
         
+        # New: Timeline tracking for true overlap analysis
+        self.io_intervals: List[tuple[float, float, int]] = [] # (start, end, bytes)
+        self.compute_intervals: List[tuple[float, float, str]] = [] # (start, end, label)
+        
     def record_layer_pass(self, layer_idx: int, io_wait: float, compute: float):
         self.layer_stats[layer_idx]['io_wait'] += io_wait
         self.layer_stats[layer_idx]['compute'] += compute
         self.layer_stats[layer_idx]['calls'] += 1
+
+    def record_io_interval(self, start: float, end: float, bytes_read: int):
+        self.io_intervals.append((start, end, bytes_read))
+        duration = end - start
+        if duration > 0:
+            self.record_pread(duration, bytes_read)
+
+    def record_compute_interval(self, start: float, end: float, label: str = "compute"):
+        self.compute_intervals.append((start, end, label))
+
+    def calculate_true_overlap(self) -> Dict[str, Any]:
+        """
+        Calculates the intersection of IO and Compute intervals to prove 
+        concurrency.
+        """
+        if not self.io_intervals or not self.compute_intervals:
+            return {
+                "overlap_s": 0.0, 
+                "compute_s": 0.0, 
+                "io_s": 0.0, 
+                "percent": 0.0, 
+                "eff_bw_gb_s": 0.0
+            }
+
+        total_compute_s = sum(e - s for s, e, _ in self.compute_intervals)
+        total_io_s = sum(e - s for s, e, _ in self.io_intervals)
+        
+        # Calculate intersection area
+        overlap_s = 0.0
+        # Sort intervals for efficient overlap calculation if needed, 
+        # but for small batches simple nested loop is fine.
+        for c_s, c_e, _ in self.compute_intervals:
+            for i_s, i_e, _ in self.io_intervals:
+                # Intersection of [c_s, c_e] and [i_s, i_e]
+                inter_s = max(c_s, i_s)
+                inter_e = min(c_e, i_e)
+                if inter_e > inter_s:
+                    overlap_s += (inter_e - inter_s)
+
+        percent = (overlap_s / total_compute_s * 100) if total_compute_s > 0 else 0
+        
+        # Effective Bandwidth during overlap
+        bytes_during_overlap = 0
+        for i_s, i_e, b in self.io_intervals:
+            # How much of this IO happened during ANY compute?
+            io_dur = i_e - i_s
+            if io_dur <= 0: continue
+            
+            overlap_with_compute = 0
+            for c_s, c_e, _ in self.compute_intervals:
+                inter_s = max(c_s, i_s)
+                inter_e = min(c_e, i_e)
+                if inter_e > inter_s:
+                    overlap_with_compute += (inter_e - inter_s)
+            
+            # Attribute bytes proportionally to the overlap time
+            bytes_during_overlap += b * (overlap_with_compute / io_dur)
+
+        eff_bw = (bytes_during_overlap / overlap_s) if overlap_s > 0 else 0
+        
+        return {
+            "overlap_s": overlap_s,
+            "compute_s": total_compute_s,
+            "io_s": total_io_s,
+            "percent": percent,
+            "eff_bw_gb_s": eff_bw / (1024**3)
+        }
 
     def record_token(self):
         self.token_times.append(time.perf_counter())
@@ -37,12 +108,7 @@ class StreamingProfiler:
         else: self.cache_stats['moe_misses'] += 1
 
     def record_pread(self, duration: float, bytes_read: int):
-        """
-        Heuristic: if a 16MB pread takes < 1ms, it was highly likely in the 
-        macOS Unified Page Cache (Warm). If it takes longer, it hit the NVMe SSD (Cold).
-        """
         # Threshold: > 2GB/s indicates it was already in RAM.
-        # e.g., 16MB in < 8ms
         threshold_s = bytes_read / (2.0 * 1024 * 1024 * 1024) 
         if duration < threshold_s:
             self.cache_stats['os_page_hits'] += 1
@@ -51,8 +117,11 @@ class StreamingProfiler:
 
     def analyze_bottlenecks(self) -> str:
         """The 'Oracle' - identifies where the system is bottlenecked."""
-        total_io = sum(s['io_wait'] for s in self.layer_stats.values())
-        total_compute = sum(s['compute'] for s in self.layer_stats.values())
+        # print(f"DEBUG: analyze_bottlenecks called on {id(self)}. IO intervals: {len(self.io_intervals)}, Compute intervals: {len(self.compute_intervals)}")
+        overlap_info = self.calculate_true_overlap()
+        
+        total_io = overlap_info['io_s']
+        total_compute = overlap_info['compute_s']
         
         durations = [self.token_times[i] - self.token_times[i-1] for i in range(1, len(self.token_times))]
         avg_tps = (len(durations) / sum(durations)) if durations and sum(durations) > 0 else 0
@@ -70,24 +139,28 @@ class StreamingProfiler:
         report.append(f"Avg Latency: {avg_latency*1000:.1f} ms/tok")
         report.append(f"Total IO Wait  : {total_io:.2f} s")
         report.append(f"Total Compute  : {total_compute:.2f} s")
+        report.append(f"True Overlap   : {overlap_info['overlap_s']:.2f} s ({overlap_info['percent']:.1f}% of compute)")
+        report.append(f"Eff. Overlap BW: {overlap_info['eff_bw_gb_s']:.2f} GB/s")
         report.append(f"MoE Miss Rate  : {moe_miss_rate*100:.1f}%")
         
+        report.append("\n--- OVERLAP PROOF ---")
+        if overlap_info['percent'] > 50:
+            report.append(f"✅ REAL OVERLAP: {overlap_info['percent']:.1f}% of GPU time was concurrent with SSD I/O.")
+        elif overlap_info['percent'] > 5:
+            report.append(f"⚠️  PARTIAL OVERLAP: Only {overlap_info['percent']:.1f}% overlap. Pipeline may be stalling.")
+        else:
+            report.append(f"❌ PIPELINED ILLUSION: Overlap is {overlap_info['percent']:.1f}%. System is behaving sequentially.")
+
         report.append("\n--- DIAGNOSIS ---")
         if moe_miss_rate > 0.8 and avg_latency > 3.0:
             report.append("⚠️  STATE: THRASHING")
             report.append("The working set size exceeds available RAM. The OS is evicting actively needed pages.")
-            report.append("Recommendation: Lower `expert_cache_size`, decrease KV cache max size, or use a smaller/higher-quantized model.")
         elif total_io > total_compute * 1.5:
             report.append("⚠️  STATE: IO-BOUND (GPU is Starving)")
-            report.append("The SSD cannot supply weights fast enough. Pipelining is waiting on disk reads.")
-            report.append("Recommendation: Reduce weight precision (e.g. Q4_0 -> Q3_K) or use a faster NVMe drive.")
         elif total_compute > total_io * 1.5:
             report.append("✅  STATE: COMPUTE-BOUND")
-            report.append("The SSD is fetching weights faster than the GPU can multiply them. Pipelining is hiding the IO perfectly.")
-            report.append("Recommendation: You have spare IO bandwidth. You can afford to increase weight precision (e.g. Q4_0 -> Q6_K) for better quality.")
         else:
             report.append("✅  STATE: BALANCED")
-            report.append("IO and Compute are perfectly matched.")
             
         return "\n".join(report)
 

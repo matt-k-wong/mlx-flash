@@ -20,6 +20,12 @@ class FlashEngine:
         self.tokenizer = tokenizer
         self.registry = HookRegistry()
         
+        # Register standard hooks based on configuration
+        from .hooks import PipeliningHook, TilingHook, DiagnosticsHook
+        self.registry.register(TilingHook(self.config))
+        self.registry.register(PipeliningHook(self.config))
+        self.registry.register(DiagnosticsHook(self.config))
+        
         # 1. Structural Phase: Allow hooks to safely rewrite the model tree
         # (e.g. replacing nn.Linear with TiledLinear)
         self.model = self.registry.dispatch_reduce("on_model_load", model)
@@ -34,6 +40,13 @@ class FlashEngine:
         # The default strategy. Complex strategies (Pipelined, MoE) are assigned 
         # dynamically by the execution logic or via hooks.
         self.default_strategy = StandardStrategy()
+        
+        # Reset profiler
+        try:
+            from benchmarks.profiler.profiler import StreamingProfiler
+            StreamingProfiler().reset()
+        except ImportError:
+            pass
 
     def _inspect_layers(self) -> list:
         sigs = []
@@ -49,9 +62,12 @@ class FlashEngine:
 
     def pre_layer_fn(self, x: mx.array) -> mx.array:
         """Embeddings and initial processing before the transformer stack."""
-        # This mirrors the logic from FlashLLM
-        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-            x = self.model.model.embed_tokens(x)
+        # Find embedding layer robustly
+        inner = getattr(self.model, "model", getattr(self.model, "backbone", self.model))
+        embed = getattr(inner, "embed_tokens", getattr(inner, "wte", getattr(inner, "embeddings", None)))
+        
+        if embed is not None:
+            x = embed(x)
             
         return x
 
@@ -75,7 +91,7 @@ class FlashEngine:
         
         self.registry.dispatch("on_generation_start", ctx)
         
-        layers = self.model.layers if hasattr(self.model, "layers") else self.model.model.layers
+        layers = self.layers
         cache_ptr = 0
 
         for i, layer in enumerate(layers):
@@ -103,7 +119,7 @@ class FlashEngine:
             # 2. Mathematical Execution
             # In a fully migrated setup, the Strategy might be swapped dynamically per layer here.
             # We use the default strategy (or a pipelined one if configured globally).
-            strategy = self.metadata.get('strategy', self.default_strategy) if hasattr(self, 'metadata') else self.default_strategy
+            strategy = ctx.metadata.get('strategy', self.default_strategy)
             
             # For this exact translation, we'll allow the context to override the strategy 
             # if a hook injected a specialized one (like MoE).
@@ -119,11 +135,15 @@ class FlashEngine:
             
         self.registry.dispatch("on_generation_end", ctx)
         
-        # Post-transformer normalization and LM head
-        if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
-            ctx.x = self.model.model.norm(ctx.x)
-        if hasattr(self.model, "lm_head"):
-            ctx.x = self.model.lm_head(ctx.x)
+        # Post-transformer normalization and LM head discovery robustly
+        inner = getattr(self.model, "model", getattr(self.model, "backbone", self.model))
+        norm = getattr(inner, "norm", getattr(inner, "ln_f", None))
+        if norm is not None:
+            ctx.x = norm(ctx.x)
+            
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is not None:
+            ctx.x = lm_head(ctx.x)
             
         return ctx.x
 

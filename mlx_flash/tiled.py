@@ -1,6 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 from typing import Optional
+import time
 
 
 class TiledColumnLinear(nn.Module):
@@ -10,16 +11,17 @@ class TiledColumnLinear(nn.Module):
     """
     def __init__(self, original_linear: nn.Linear, tile_size: int = 1024):
         super().__init__()
-        self.weight = original_linear.weight
-        self.bias = original_linear.bias
+        self.weight = getattr(original_linear, "weight")
+        self.bias = getattr(original_linear, "bias", None)
         self.tile_size = tile_size
-        self.in_features = original_linear.weight.shape[1]
-        self.out_features = original_linear.weight.shape[0]
+        self.in_features = self.weight.shape[1]
+        self.out_features = self.weight.shape[0]
 
     def __call__(self, x: mx.array) -> mx.array:
         outputs = []
         
         for i in range(0, self.out_features, self.tile_size):
+            t0 = time.perf_counter()
             # Slicing the lazy weight array. 
             # In MLX, this avoids materializing the whole weight if it's on disk.
             w_tile = self.weight[i:i+self.tile_size, :]
@@ -33,6 +35,15 @@ class TiledColumnLinear(nn.Module):
                 y_tile = y_tile + b_tile
                 
             mx.eval(y_tile) # Force evaluation to bound memory
+            mx.synchronize()
+            t1 = time.perf_counter()
+            
+            try:
+                from benchmarks.profiler.profiler import StreamingProfiler
+                StreamingProfiler().record_compute_interval(t0, t1, "tiled_column")
+            except ImportError:
+                pass
+                
             outputs.append(y_tile)
             
             # Clear intermediate metal buffers
@@ -51,11 +62,11 @@ class TiledRowLinear(nn.Module):
     """
     def __init__(self, original_linear: nn.Linear, tile_size: int = 1024):
         super().__init__()
-        self.weight = original_linear.weight
-        self.bias = original_linear.bias
+        self.weight = getattr(original_linear, "weight")
+        self.bias = getattr(original_linear, "bias", None)
         self.tile_size = tile_size
-        self.in_features = original_linear.weight.shape[1]
-        self.out_features = original_linear.weight.shape[0]
+        self.in_features = self.weight.shape[1]
+        self.out_features = self.weight.shape[0]
 
     def __call__(self, x: mx.array) -> mx.array:
         # CRITICAL: Accumulate in FP32 to prevent catastrophic cancellation
@@ -64,6 +75,7 @@ class TiledRowLinear(nn.Module):
         y_accum = mx.zeros((*x.shape[:-1], self.out_features), dtype=mx.float32)
         
         for i in range(0, self.in_features, self.tile_size):
+            t0 = time.perf_counter()
             # Weight slice: [out_features, tile_size]
             w_tile = self.weight[:, i:i+self.tile_size]
             
@@ -75,6 +87,14 @@ class TiledRowLinear(nn.Module):
             
             y_accum = y_accum + y_partial
             mx.eval(y_accum) # Force evaluation to bound memory
+            mx.synchronize()
+            t1 = time.perf_counter()
+            
+            try:
+                from benchmarks.profiler.profiler import StreamingProfiler
+                StreamingProfiler().record_compute_interval(t0, t1, "tiled_row")
+            except ImportError:
+                pass
             
             del w_tile, x_tile, y_partial
             mx.metal.clear_cache()
