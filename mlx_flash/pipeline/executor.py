@@ -20,11 +20,16 @@ class PipelinedExecutor:
             
         ranges = self.mmap_cache.get_layer_ranges(layer_idx)
         
-        for _, (start, end, filename, dtype) in ranges.items():
+        for mm, (start, end, filename, dtype) in ranges.items():
             align_bytes = 1
             if dtype == "q4_0": align_bytes = 18
             elif dtype == "q8_0": align_bytes = 34
             elif dtype.startswith("q"): align_bytes = 256
+
+            # Notify bandwidth controller about incoming work
+            if hasattr(self.mmap_cache.prefetch_worker.bandwidth_controller, 'enqueue_io'):
+                self.mmap_cache.prefetch_worker.bandwidth_controller.enqueue_io(end - start)
+
             self.mmap_cache.prefetch_worker.enqueue(filename, start, end - start, layer_idx, align_bytes=align_bytes)
 
     def _wait_for_layer(self, layer_idx: int):

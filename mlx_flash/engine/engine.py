@@ -104,6 +104,16 @@ class FlashEngine:
             ctx.layer_idx = i
             _, ctx.has_mask, ctx.has_cache = self._layer_sigs[i]
             
+            # Notify bandwidth controller about layer transition for MPC prediction
+            mmap_cache = getattr(self, 'mmap_cache', None)
+            if mmap_cache is None and hasattr(self.model, 'manager'):
+                 mmap_cache = getattr(self.model.manager.model, 'mmap_cache', None)
+            
+            if mmap_cache and hasattr(mmap_cache, 'prefetch_worker'):
+                controller = getattr(mmap_cache.prefetch_worker, 'bandwidth_controller', None)
+                if controller and hasattr(controller, 'notify_layer_start'):
+                    controller.notify_layer_start(i)
+
             # Resolve Cache Entry
             ctx.cache_entry = None
             if ctx.cache is not None and ctx.has_cache:
