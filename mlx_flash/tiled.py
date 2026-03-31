@@ -19,24 +19,34 @@ class TiledColumnLinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         outputs = []
+        original_dtype = x.dtype
+
         for i in range(0, self.out_features, self.tile_size):
             t0 = time.perf_counter()
             w_tile = self.weight[i:i+self.tile_size, :]
-            y_tile = mx.matmul(x, w_tile.T)
+
+            # Compute matmul in FP32 for stability parity with standard MLX Linear
+            y_tile = mx.matmul(x.astype(mx.float32), w_tile.T.astype(mx.float32))
+
             if self.bias is not None:
                 b_tile = self.bias[i:i+self.tile_size]
-                y_tile = y_tile + b_tile
+                y_tile = y_tile + b_tile.astype(mx.float32)
+
             mx.eval(y_tile)
             mx.synchronize()
             t1 = time.perf_counter()
+
             try:
                 from benchmarks.profiler.profiler import StreamingProfiler
                 StreamingProfiler().record_compute_interval(t0, t1, "tiled_column")
             except ImportError:
                 pass
-            outputs.append(y_tile)
+
+            outputs.append(y_tile.astype(original_dtype))
             del w_tile
+
         return mx.concatenate(outputs, axis=-1)
+
 
 
 class TiledRowLinear(nn.Module):
