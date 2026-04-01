@@ -235,7 +235,9 @@ class PipelinedExecutor:
         
         if attn_module is not None:
             call_kwargs = {}
-            if mask is not None: call_kwargs["mask"] = mask
+            if mask is not None:
+                # Support both array masks and the 'causal' string hint
+                call_kwargs["mask"] = mask
             if cache is not None: call_kwargs["cache"] = cache
             
             attn_out = attn_module(h, **call_kwargs)

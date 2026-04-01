@@ -211,8 +211,12 @@ class QuantizedDiskKVCache(KVCache):
             return mx.concatenate([disk_k, self.local_k], axis=2), mx.concatenate([disk_v, self.local_v], axis=2)
         return self.local_k, self.local_v
 
-    def size(self):
+    @property
+    def offset(self):
         return self.disk_offset + (self.local_k.shape[2] if self.local_k is not None else 0)
+
+    def size(self):
+        return self.offset
 
     @property
     def state(self):
